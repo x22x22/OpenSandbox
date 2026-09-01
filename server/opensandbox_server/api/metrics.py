@@ -24,6 +24,7 @@ from fastapi import APIRouter, Header, Response, status
 
 from opensandbox_server.api.schema import MetricsEvent
 from opensandbox_server.integrations.otel import record_sandbox_create_duration
+from opensandbox_server.integrations.server_metrics import render_text as render_server_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -81,3 +82,18 @@ def report_metrics_event(
             event.success,
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/metrics", include_in_schema=False)
+def prometheus_metrics() -> Response:
+    """Expose server-side sandbox lifecycle metrics in Prometheus text format.
+
+    Scrapeable by netdata go.d prometheus / Prometheus; no OTLP endpoint
+    required. Records every Docker operation through _docker_operation:
+    create/start/kill/remove counts (by status), in-flight gauge and
+    duration histogram.
+    """
+    return Response(
+        content=render_server_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )

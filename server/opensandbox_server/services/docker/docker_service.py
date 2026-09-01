@@ -58,6 +58,10 @@ from opensandbox_server.api.schema import (
     PlatformSpec,
 )
 from opensandbox_server.config import AppConfig, get_config
+from opensandbox_server.integrations.server_metrics import (
+    record_op_end,
+    record_op_start,
+)
 from opensandbox_server.services.docker.docker_diagnostics import DockerDiagnosticsMixin
 from opensandbox_server.services.docker.runtime import (
     DockerRuntimeMixin,
@@ -221,13 +225,20 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
 
     @contextmanager
     def _docker_operation(self, action: str, sandbox_id: Optional[str] = None):
-        """Context manager to log duration for Docker API calls."""
+        """Context manager to log duration for Docker API calls.
+
+        Every Docker operation is also recorded into the server-side
+        Prometheus metrics (opensandbox_sandbox_ops_*) so sandbox
+        create/start/kill/remove retry storms are directly observable.
+        """
         op_id = sandbox_id or "shared"
         start = time.perf_counter()
+        record_op_start(action)
         try:
             yield
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - start) * 1000
+            record_op_end(action, "failure", elapsed_ms)
             logger.warning(
                 "sandbox=%s | action=%s | duration=%.2f | error=%s",
                 op_id,
@@ -238,6 +249,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             raise
         else:
             elapsed_ms = (time.perf_counter() - start) * 1000
+            record_op_end(action, "success", elapsed_ms)
             logger.info(
                 "sandbox=%s | action=%s | duration=%.2f",
                 op_id,
