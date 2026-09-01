@@ -530,18 +530,20 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             logger.info("Restored expiration timers for %d sandbox(es).", restored)
 
     def _read_oom_kill_count(self, container) -> Optional[int]:
-        """Read the container cgroup memory.events oom_kill count (cgroup v2).
+        """Read the container cgroup OOM-kill counter (v2 or v1).
 
-        Docker containers run on cgroup v2 expose ``/sys/fs/cgroup/memory.events``
-        with an ``oom_kill`` counter. A positive value proves a process inside
-        the container was killed by the OOM killer (e.g. the opencode server
-        process), even when the container itself is still running — this is the
-        process-level OOM signature that ``State.OOMKilled`` cannot detect.
+        cgroup v2: ``/sys/fs/cgroup/memory.events`` exposes ``oom_kill``.
+        cgroup v1: ``/sys/fs/cgroup/memory/memory.oom_control`` exposes
+        ``oom_kill``. A positive value proves a process inside the container
+        was killed by the OOM killer (e.g. the opencode server process), even
+        when the container itself is still running — this is the process-level
+        OOM signature that ``State.OOMKilled`` cannot detect (that flag only
+        fires for the container's main process).
 
         Uses a short TTL cache per container id to avoid exec cost on every
         list/get call. Returns ``None`` when the file is unavailable or exec
-        fails (e.g. cgroup v1, non-Linux runtime, container just terminated),
-        so callers can degrade gracefully.
+        fails (e.g. non-Linux runtime, container just terminated), so callers
+        can degrade gracefully.
         """
         container_id = getattr(container, "id", "") or ""
         if not container_id:
@@ -551,29 +553,26 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             cached = self._oom_kill_cache.get(container_id)
             if cached is not None and now - cached[0] < self._oom_kill_cache_ttl_seconds:
                 return cached[1]
+        count: Optional[int] = None
         try:
+            # cgroup v2 优先：memory.events 的 oom_kill 行。
             exec_result = container.exec_run(
                 "cat /sys/fs/cgroup/memory.events",
                 stdout=True,
                 stderr=True,
             )
-            exit_code = int(getattr(exec_result, "exit_code", -1) or -1)
-            output = getattr(exec_result, "output", b"")
-            if isinstance(output, bytes):
-                output = output.decode("utf-8", errors="replace")
-            if exit_code != 0:
-                return None
-            count: Optional[int] = None
-            for line in str(output).splitlines():
-                key, _, value = line.partition(" ")
-                if key.strip() == "oom_kill":
-                    try:
-                        count = int(value.strip())
-                    except ValueError:
-                        count = None
-                    break
-            with self._oom_kill_cache_lock:
-                if count is not None:
+            count = self._parse_oom_kill_from_exec(exec_result)
+            if count is None:
+                # v1 兜底：memory.oom_control 的 oom_kill 行（v2 文件不存在时
+                # 再读；注意 docker exec 不走 shell，不能拼 || 组合命令）。
+                exec_result = container.exec_run(
+                    "cat /sys/fs/cgroup/memory/memory.oom_control",
+                    stdout=True,
+                    stderr=True,
+                )
+                count = self._parse_oom_kill_from_exec(exec_result)
+            if count is not None:
+                with self._oom_kill_cache_lock:
                     self._oom_kill_cache[container_id] = (now, count)
             return count
         except Exception:  # noqa: BLE001 - best-effort evidence only
@@ -583,6 +582,33 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 exc_info=True,
             )
             return None
+
+    @staticmethod
+    def _parse_oom_kill_from_exec(exec_result) -> Optional[int]:
+        """从 exec 结果解析 oom_kill 计数；exec 失败返回 None。
+
+        注意 exit_code 为 0（成功）时 ``0 or -1`` 会求值为 -1，必须显式判空。
+        """
+        raw_exit = getattr(exec_result, "exit_code", None)
+        if raw_exit is None:
+            return None
+        try:
+            exit_code = int(raw_exit)
+        except (TypeError, ValueError):
+            return None
+        if exit_code != 0:
+            return None
+        output = getattr(exec_result, "output", b"")
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        for line in str(output).splitlines():
+            key, _, value = line.partition(" ")
+            if key.strip() == "oom_kill":
+                try:
+                    return int(value.strip())
+                except ValueError:
+                    return None
+        return None
 
     def _container_to_sandbox(self, container, sandbox_id: Optional[str] = None) -> Sandbox:
         labels = container.attrs.get("Config", {}).get("Labels") or {}
