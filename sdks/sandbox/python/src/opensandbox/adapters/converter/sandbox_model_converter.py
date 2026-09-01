@@ -631,11 +631,44 @@ class SandboxModelConverter:
             elif isinstance(lta_val, Unset) or lta_val is None:
                 last_transition_at = None
 
+        oom_killed: bool | None = None
+        if hasattr(api_status, "oom_killed"):
+            ok_val = api_status.oom_killed
+            if isinstance(ok_val, bool):
+                oom_killed = ok_val
+
+        oom_kill_count: int | None = None
+        if hasattr(api_status, "oom_kill_count"):
+            okc_val = api_status.oom_kill_count
+            if isinstance(okc_val, int):
+                oom_kill_count = okc_val
+
+        oom_event_at: datetime | None = None
+        if hasattr(api_status, "oom_event_at"):
+            oea_val = api_status.oom_event_at
+            if isinstance(oea_val, str):
+                from dateutil.parser import isoparse
+
+                try:
+                    oom_event_at = isoparse(oea_val)
+                except (ValueError, TypeError):
+                    oom_event_at = None
+
+        memory_limit_bytes: int | None = None
+        if hasattr(api_status, "memory_limit_bytes"):
+            mlb_val = api_status.memory_limit_bytes
+            if isinstance(mlb_val, int):
+                memory_limit_bytes = mlb_val
+
         return SandboxStatus(
             state=api_status.state,
             reason=reason,
             message=message,
             last_transition_at=last_transition_at,
+            oom_killed=oom_killed,
+            oom_kill_count=oom_kill_count,
+            oom_event_at=oom_event_at,
+            memory_limit_bytes=memory_limit_bytes,
         )
 
     @staticmethod

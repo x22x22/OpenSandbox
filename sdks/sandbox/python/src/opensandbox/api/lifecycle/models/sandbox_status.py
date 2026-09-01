@@ -68,6 +68,10 @@ class SandboxStatus:
     reason: str | Unset = UNSET
     message: str | Unset = UNSET
     last_transition_at: datetime.datetime | Unset = UNSET
+    oom_killed: bool | Unset = UNSET
+    oom_kill_count: int | Unset = UNSET
+    oom_event_at: str | Unset = UNSET
+    memory_limit_bytes: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -80,6 +84,14 @@ class SandboxStatus:
         last_transition_at: str | Unset = UNSET
         if not isinstance(self.last_transition_at, Unset):
             last_transition_at = self.last_transition_at.isoformat()
+
+        oom_killed = self.oom_killed
+
+        oom_kill_count = self.oom_kill_count
+
+        oom_event_at = self.oom_event_at
+
+        memory_limit_bytes = self.memory_limit_bytes
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -94,6 +106,14 @@ class SandboxStatus:
             field_dict["message"] = message
         if last_transition_at is not UNSET:
             field_dict["lastTransitionAt"] = last_transition_at
+        if oom_killed is not UNSET:
+            field_dict["oomKilled"] = oom_killed
+        if oom_kill_count is not UNSET:
+            field_dict["oomKillCount"] = oom_kill_count
+        if oom_event_at is not UNSET:
+            field_dict["oomEventAt"] = oom_event_at
+        if memory_limit_bytes is not UNSET:
+            field_dict["memoryLimitBytes"] = memory_limit_bytes
 
         return field_dict
 
@@ -113,11 +133,31 @@ class SandboxStatus:
         else:
             last_transition_at = isoparse(_last_transition_at)
 
+        oom_killed = d.pop("oomKilled", UNSET)
+        if not isinstance(oom_killed, bool):
+            oom_killed = UNSET
+
+        oom_kill_count = d.pop("oomKillCount", UNSET)
+        if not isinstance(oom_kill_count, int):
+            oom_kill_count = UNSET
+
+        oom_event_at = d.pop("oomEventAt", UNSET)
+        if not isinstance(oom_event_at, str):
+            oom_event_at = UNSET
+
+        memory_limit_bytes = d.pop("memoryLimitBytes", UNSET)
+        if not isinstance(memory_limit_bytes, int):
+            memory_limit_bytes = UNSET
+
         sandbox_status = cls(
             state=state,
             reason=reason,
             message=message,
             last_transition_at=last_transition_at,
+            oom_killed=oom_killed,
+            oom_kill_count=oom_kill_count,
+            oom_event_at=oom_event_at,
+            memory_limit_bytes=memory_limit_bytes,
         )
 
         sandbox_status.additional_properties = d

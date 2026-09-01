@@ -372,3 +372,56 @@ def test_sandbox_model_converter_supports_windows_platform_request() -> None:
     )
     dumped = req.to_dict()
     assert dumped["platform"] == {"os": "windows", "arch": "amd64"}
+
+
+def test_sandbox_model_converter_preserves_oom_evidence_fields() -> None:
+    """进程级 OOM 证据（oomKillCount 等）必须穿过 API→converter→domain 全链路。
+
+    test5 2026-09-01 回归：服务器已返回 oomKillCount/oomKilled，但
+    api.lifecycle SandboxStatus.from_dict 把未知字段丢进 additional_properties，
+    _convert_sandbox_status 也不提取 → SDK probe_sandbox_oom 永远拿不到
+    oom_kill_count → 故障被误报为普通执行失败（error.chat_execution_failed）。
+    """
+    from opensandbox.api.lifecycle.models.sandbox import Sandbox
+    from opensandbox.api.lifecycle.models.sandbox_status import SandboxStatus
+
+    api_sandbox = Sandbox(
+        id="sbx-oom-1",
+        status=SandboxStatus.from_dict(
+            {
+                "state": "Running",
+                "reason": "CONTAINER_RUNNING_OOM_KILLED_PROCESS",
+                "message": "cgroup recorded 3 OOM-killed process(es).",
+                "oomKilled": True,
+                "oomKillCount": 3,
+                "oomEventAt": "2026-09-01T11:06:35.442563Z",
+                "memoryLimitBytes": 2147483648,
+            }
+        ),
+        created_at=datetime(2025, 1, 1),
+        entrypoint=["/bin/sh"],
+    )
+
+    converted = SandboxModelConverter.to_sandbox_info(api_sandbox)
+    assert converted.status.oom_killed is True
+    assert converted.status.oom_kill_count == 3
+    assert converted.status.memory_limit_bytes == 2147483648
+    assert converted.status.oom_event_at is not None
+
+
+def test_sandbox_model_converter_oom_fields_default_when_absent() -> None:
+    """服务器未返回 oom 字段时，domain 字段为 None（probe 据此优雅降级）。"""
+    from opensandbox.api.lifecycle.models.sandbox import Sandbox
+    from opensandbox.api.lifecycle.models.sandbox_status import SandboxStatus
+
+    api_sandbox = Sandbox(
+        id="sbx-oom-2",
+        status=SandboxStatus(state="Running"),
+        created_at=datetime(2025, 1, 1),
+        entrypoint=["/bin/sh"],
+    )
+
+    converted = SandboxModelConverter.to_sandbox_info(api_sandbox)
+    assert converted.status.oom_killed is None
+    assert converted.status.oom_kill_count is None
+    assert converted.status.memory_limit_bytes is None
