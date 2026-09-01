@@ -580,6 +580,27 @@ class SandboxStatus(BaseModel):
         description="Timestamp of last state transition",
         alias="last_transition_at",
     )
+    # OOM 证据（server 端填充，供 SDK 在失效判别时读取）。
+    oom_killed: bool | None = Field(
+        default=None,
+        description="True when the container itself was killed by the OOM killer",
+        alias="oomKilled",
+    )
+    oom_kill_count: int | None = Field(
+        default=None,
+        description="Cumulative cgroup memory.events oom_kill count for the container",
+        alias="oomKillCount",
+    )
+    oom_event_at: datetime | None = Field(
+        default=None,
+        description="Timestamp of the most recent OOM-kill event, when determinable",
+        alias="oomEventAt",
+    )
+    memory_limit_bytes: int | None = Field(
+        default=None,
+        description="Container memory hard limit in bytes (HostConfig.Memory)",
+        alias="memoryLimitBytes",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 

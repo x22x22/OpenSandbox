@@ -379,6 +379,30 @@ class SandboxStatus(BaseModel):
         alias="lastTransitionAt",
         description="Timestamp of the last state transition",
     )
+    # --- OOM 证据（进程级/容器级） ---
+    # 容器级：docker State.OOMKilled（容器主进程被 OOM killer 终止）。
+    # 进程级：容器 cgroup memory.events 的 oom_kill 计数增量 > 0（容器内任意
+    # 进程被 OOM killer 终止，容器本身可能仍存活——沙箱内 opencode 被杀即此场景）。
+    oom_killed: Optional[bool] = Field(
+        None,
+        alias="oomKilled",
+        description="True when the container itself was killed by the OOM killer (docker State.OOMKilled)",
+    )
+    oom_kill_count: Optional[int] = Field(
+        None,
+        alias="oomKillCount",
+        description="Cumulative cgroup memory.events oom_kill count for the container (0/None when unavailable)",
+    )
+    oom_event_at: Optional[datetime] = Field(
+        None,
+        alias="oomEventAt",
+        description="Timestamp of the most recent OOM-kill event, when determinable",
+    )
+    memory_limit_bytes: Optional[int] = Field(
+        None,
+        alias="memoryLimitBytes",
+        description="Container memory hard limit in bytes (HostConfig.Memory)",
+    )
 
     class Config:
         populate_by_name = True

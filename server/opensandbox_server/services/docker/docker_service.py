@@ -201,6 +201,11 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         self._expiration_timers: Dict[str, Timer] = {}
         self._ossfs_mount_lock = Lock()
         self._ossfs_mount_ref_counts: Dict[str, int] = {}
+        # cgroup memory.events oom_kill 计数短 TTL 缓存（避免每次 list/get
+        # sandbox 都 exec_run 打容器）；仅用于 OOM 证据暴露，不参与生命周期。
+        self._oom_kill_cache_lock = Lock()
+        self._oom_kill_cache: Dict[str, tuple[float, int]] = {}
+        self._oom_kill_cache_ttl_seconds = 5.0
         self._restore_existing_sandboxes()
 
         # Initialize secure runtime resolver
@@ -512,6 +517,61 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         if restored:
             logger.info("Restored expiration timers for %d sandbox(es).", restored)
 
+    def _read_oom_kill_count(self, container) -> Optional[int]:
+        """Read the container cgroup memory.events oom_kill count (cgroup v2).
+
+        Docker containers run on cgroup v2 expose ``/sys/fs/cgroup/memory.events``
+        with an ``oom_kill`` counter. A positive value proves a process inside
+        the container was killed by the OOM killer (e.g. the opencode server
+        process), even when the container itself is still running — this is the
+        process-level OOM signature that ``State.OOMKilled`` cannot detect.
+
+        Uses a short TTL cache per container id to avoid exec cost on every
+        list/get call. Returns ``None`` when the file is unavailable or exec
+        fails (e.g. cgroup v1, non-Linux runtime, container just terminated),
+        so callers can degrade gracefully.
+        """
+        container_id = getattr(container, "id", "") or ""
+        if not container_id:
+            return None
+        now = time.time()
+        with self._oom_kill_cache_lock:
+            cached = self._oom_kill_cache.get(container_id)
+            if cached is not None and now - cached[0] < self._oom_kill_cache_ttl_seconds:
+                return cached[1]
+        try:
+            exec_result = container.exec_run(
+                "cat /sys/fs/cgroup/memory.events",
+                stdout=True,
+                stderr=True,
+            )
+            exit_code = int(getattr(exec_result, "exit_code", -1) or -1)
+            output = getattr(exec_result, "output", b"")
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            if exit_code != 0:
+                return None
+            count: Optional[int] = None
+            for line in str(output).splitlines():
+                key, _, value = line.partition(" ")
+                if key.strip() == "oom_kill":
+                    try:
+                        count = int(value.strip())
+                    except ValueError:
+                        count = None
+                    break
+            with self._oom_kill_cache_lock:
+                if count is not None:
+                    self._oom_kill_cache[container_id] = (now, count)
+            return count
+        except Exception:  # noqa: BLE001 - best-effort evidence only
+            logger.debug(
+                "Failed to read cgroup oom_kill count for container %s",
+                container_id,
+                exc_info=True,
+            )
+            return None
+
     def _container_to_sandbox(self, container, sandbox_id: Optional[str] = None) -> Sandbox:
         labels = container.attrs.get("Config", {}).get("Labels") or {}
         resolved_id = sandbox_id or labels.get(SANDBOX_ID_LABEL)
@@ -532,10 +592,23 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         exit_code = status_section.get("ExitCode")
         finished_at = status_section.get("FinishedAt")
 
+        # OOM 证据：容器级 State.OOMKilled + 进程级 cgroup memory.events oom_kill。
+        # 进程级 OOM（沙箱内 opencode 被 OOM killer 杀掉、容器仍存活）是
+        # State.OOMKilled 检测不到的，必须读 cgroup 计数。
+        oom_killed = bool(status_section.get("OOMKilled", False))
+        oom_kill_count = self._read_oom_kill_count(container)
+        host_memory = (container.attrs.get("HostConfig") or {}).get("Memory") or 0
+
         if running and not paused:
             state = "Running"
             reason = "CONTAINER_RUNNING"
             message = "Sandbox container is running."
+            if oom_kill_count and oom_kill_count > 0:
+                reason = "CONTAINER_RUNNING_OOM_KILLED_PROCESS"
+                message = (
+                    f"Sandbox container is running but its cgroup recorded "
+                    f"{oom_kill_count} OOM-killed process(es)."
+                )
         elif paused:
             state = "Paused"
             reason = "CONTAINER_PAUSED"
@@ -553,6 +626,10 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 state = "Terminated"
                 reason = "CONTAINER_EXITED"
                 message = "Sandbox container exited successfully."
+            elif oom_killed:
+                state = "Failed"
+                reason = "CONTAINER_OOM_KILLED"
+                message = "Sandbox container was killed by the OOM killer."
             else:
                 state = "Failed"
                 reason = "CONTAINER_EXITED_ERROR"
@@ -584,6 +661,9 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             reason=reason,
             message=message,
             last_transition_at=last_transition_at,
+            oom_killed=oom_killed or None,
+            oom_kill_count=oom_kill_count,
+            memory_limit_bytes=int(host_memory) if host_memory else None,
         )
         platform_spec = self._resolve_platform_for_container(container, labels)
 
