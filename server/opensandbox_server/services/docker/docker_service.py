@@ -834,7 +834,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     effective_mem_limit, effective_nano_cpus, self.network_mode,
                     gpu_count=effective_gpu_count,
                 )
-                if self.network_mode != HOST_NETWORK_MODE:
+                if self.network_mode != HOST_NETWORK_MODE and self.app_config.docker.publish_ports:
                     port_bindings = allocate_port_bindings(exposed_ports, min_port=self.app_config.docker.port_range_min, max_port=self.app_config.docker.port_range_max)
                     host_execd_port = port_bindings["44772"][1]
                     host_http_port = port_bindings["8080"][1]
@@ -842,6 +842,8 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     labels[SANDBOX_EMBEDDING_PROXY_PORT_LABEL] = str(host_execd_port)
                     labels[SANDBOX_HTTP_PORT_LABEL] = str(host_http_port)
                 else:
+                    # publish_ports=false (same-network clients) or host mode:
+                    # do not bind host ports; clients reach sandboxes via container IP.
                     exposed_ports = None
 
             # Inject volume bind mounts into Docker host config

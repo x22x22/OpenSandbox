@@ -885,6 +885,17 @@ class DockerConfig(BaseModel):
             "Each sandbox needs 2–3 host ports (2 without egress, 3 with egress sidecar)."
         ),
     )
+    publish_ports: bool = Field(
+        default=False,
+        description=(
+            "Whether to publish sandbox container ports to the host (bridge-mode host port "
+            "mapping for execd 44772 and HTTP 8080). When false, sandboxes run without host "
+            "port bindings; clients inside the same Docker network reach them directly via "
+            "container IP:port (like the Kubernetes Pod-IP model). Defaults to false for "
+            "same-network deployments; set true only when clients must reach sandboxes from "
+            "outside the Docker network via host-mapped ports."
+        ),
+    )
     pids_limit: Optional[int] = Field(
         default=4096,
         ge=1,

@@ -245,6 +245,10 @@ class DockerNetworkingMixin:
         # non-host mode (bridge / user-defined network)
         container = self._get_container_by_sandbox_id(sandbox_id)
         labels = container.attrs.get("Config", {}).get("Labels") or {}
+        if not self.app_config.docker.publish_ports:
+            # Same-network clients reach sandboxes directly via container IP:port
+            # (no host port binding was created for the sandbox).
+            return self._resolve_internal_endpoint(container, port)
         return self._resolve_host_mapped_endpoint(public_host, labels, port)
 
     def _resolve_host_mapped_endpoint(
