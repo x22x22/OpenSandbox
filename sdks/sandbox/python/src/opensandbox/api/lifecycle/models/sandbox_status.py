@@ -72,6 +72,7 @@ class SandboxStatus:
     oom_kill_count: int | Unset = UNSET
     oom_event_at: str | Unset = UNSET
     memory_limit_bytes: int | Unset = UNSET
+    memory_usage_bytes: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +93,8 @@ class SandboxStatus:
         oom_event_at = self.oom_event_at
 
         memory_limit_bytes = self.memory_limit_bytes
+
+        memory_usage_bytes = self.memory_usage_bytes
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -114,6 +117,8 @@ class SandboxStatus:
             field_dict["oomEventAt"] = oom_event_at
         if memory_limit_bytes is not UNSET:
             field_dict["memoryLimitBytes"] = memory_limit_bytes
+        if memory_usage_bytes is not UNSET:
+            field_dict["memoryUsageBytes"] = memory_usage_bytes
 
         return field_dict
 
@@ -149,6 +154,10 @@ class SandboxStatus:
         if not isinstance(memory_limit_bytes, int):
             memory_limit_bytes = UNSET
 
+        memory_usage_bytes = d.pop("memoryUsageBytes", UNSET)
+        if not isinstance(memory_usage_bytes, int):
+            memory_usage_bytes = UNSET
+
         sandbox_status = cls(
             state=state,
             reason=reason,
@@ -158,6 +167,7 @@ class SandboxStatus:
             oom_kill_count=oom_kill_count,
             oom_event_at=oom_event_at,
             memory_limit_bytes=memory_limit_bytes,
+            memory_usage_bytes=memory_usage_bytes,
         )
 
         sandbox_status.additional_properties = d

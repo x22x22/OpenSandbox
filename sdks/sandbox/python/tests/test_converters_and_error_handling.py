@@ -425,3 +425,39 @@ def test_sandbox_model_converter_oom_fields_default_when_absent() -> None:
     assert converted.status.oom_killed is None
     assert converted.status.oom_kill_count is None
     assert converted.status.memory_limit_bytes is None
+
+
+def test_sandbox_status_round_trips_memory_usage_bytes() -> None:
+    """API SandboxStatus 必须能解析/序列化 memoryUsageBytes（当前沙箱 cgroup 占用）。
+
+    test5 2026-09-02 需求：OOM 恢复时让 agent 知道当前内存大小。server 返回
+    memoryUsageBytes，SDK API model 不能把它丢进 additional_properties，否则
+    converter/SDK probe 读不到。
+    """
+    from opensandbox.api.lifecycle.models.sandbox_status import SandboxStatus
+
+    status = SandboxStatus.from_dict(
+        {
+            "state": "Running",
+            "oomKillCount": 2,
+            "memoryLimitBytes": 2147483648,
+            "memoryUsageBytes": 1841250304,
+        }
+    )
+    assert status.memory_usage_bytes == 1841250304
+    assert status.memory_limit_bytes == 2147483648
+    # additional_properties 不应残留该字段（已被显式消费）
+    assert "memoryUsageBytes" not in status.additional_properties
+    dumped = status.to_dict()
+    assert dumped["memoryUsageBytes"] == 1841250304
+    assert dumped["memoryLimitBytes"] == 2147483648
+
+
+def test_sandbox_status_memory_usage_optional() -> None:
+    """server 未返回 memoryUsageBytes（旧 server）时缺省 UNSET，不报错。"""
+    from opensandbox.api.lifecycle.models.sandbox_status import SandboxStatus
+    from opensandbox.api.lifecycle.types import UNSET
+
+    status = SandboxStatus.from_dict({"state": "Running"})
+    assert status.memory_usage_bytes is UNSET
+    assert "memoryUsageBytes" not in status.to_dict()
