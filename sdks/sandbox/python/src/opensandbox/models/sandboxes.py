@@ -601,6 +601,15 @@ class SandboxStatus(BaseModel):
         description="Container memory hard limit in bytes (HostConfig.Memory)",
         alias="memoryLimitBytes",
     )
+    memory_usage_bytes: int | None = Field(
+        default=None,
+        description=(
+            "Current sandbox cgroup memory usage in bytes (v2 memory.current / "
+            "v1 memory.usage_in_bytes; None when unavailable). This is the "
+            "sandbox's own cgroup, not the host's."
+        ),
+        alias="memoryUsageBytes",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 

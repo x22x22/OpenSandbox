@@ -24,6 +24,9 @@ def _service_without_init() -> DockerSandboxService:
     svc._oom_kill_cache_lock = Lock()
     svc._oom_kill_cache = {}
     svc._oom_kill_cache_ttl_seconds = 5.0
+    svc._memory_usage_cache_lock = Lock()
+    svc._memory_usage_cache = {}
+    svc._memory_usage_cache_ttl_seconds = 5.0
     return svc
 
 
@@ -121,3 +124,51 @@ def test_sandbox_status_oom_fields_optional() -> None:
     assert status.oom_killed is None
     assert status.oom_kill_count is None
     assert status.memory_limit_bytes is None
+
+
+# ---------------------------------------------------------------------------
+# _read_memory_usage_bytes（2026-09-02：让 agent 知道当前沙箱内存占用）
+# ---------------------------------------------------------------------------
+
+def test_read_memory_usage_bytes_v2_current() -> None:
+    """v2 主机：memory.current 直接给出当前字节数。"""
+    svc = _service_without_init()
+    container = _container_with_exec(
+        [
+            _exec_result(0, b"123456789\n"),
+            _exec_result(1, b"cat: ...: No such file or directory\n"),
+        ]
+    )
+    assert svc._read_memory_usage_bytes(container) == 123456789
+
+
+def test_read_memory_usage_bytes_v1_usage_in_bytes() -> None:
+    """v1 主机：memory.current 不存在 → 兜底 memory.usage_in_bytes。"""
+    svc = _service_without_init()
+    container = _container_with_exec(
+        [
+            _exec_result(1, b"cat: memory.current: No such file or directory\n"),
+            _exec_result(0, b"987654321\n"),
+        ]
+    )
+    assert svc._read_memory_usage_bytes(container) == 987654321
+
+
+def test_read_memory_usage_bytes_degrades_to_none() -> None:
+    """两次 exec 都失败 → None（优雅降级，不阻断主链路）。"""
+    svc = _service_without_init()
+    container = _container_with_exec(
+        [_exec_result(1, b"err\n"), _exec_result(1, b"err\n")]
+    )
+    assert svc._read_memory_usage_bytes(container) is None
+
+
+def test_sandbox_status_has_memory_usage_bytes() -> None:
+    status = SandboxStatus(
+        state="Running",
+        oom_kill_count=2,
+        memory_limit_bytes=2147483648,
+        memory_usage_bytes=1073741824,
+    )
+    assert status.memory_usage_bytes == 1073741824
+    assert status.model_dump(by_alias=True)["memoryUsageBytes"] == 1073741824

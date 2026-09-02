@@ -210,6 +210,11 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         self._oom_kill_cache_lock = Lock()
         self._oom_kill_cache: Dict[str, tuple[float, int]] = {}
         self._oom_kill_cache_ttl_seconds = 5.0
+        # cgroup 当前内存占用短 TTL 缓存（memory.current / usage_in_bytes），
+        # 供 SandboxStatus.memory_usage_bytes 暴露，不参与生命周期。
+        self._memory_usage_cache_lock = Lock()
+        self._memory_usage_cache: Dict[str, tuple[float, int]] = {}
+        self._memory_usage_cache_ttl_seconds = 5.0
         self._restore_existing_sandboxes()
 
         # Initialize secure runtime resolver
@@ -610,6 +615,80 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     return None
         return None
 
+    def _read_memory_usage_bytes(self, container) -> Optional[int]:
+        """Read the container cgroup current memory usage (v2 or v1).
+
+        cgroup v2: ``/sys/fs/cgroup/memory.current`` exposes the current
+        memory usage in bytes. cgroup v1: ``/sys/fs/cgroup/memory/
+        memory.usage_in_bytes`` exposes the same. This is the sandbox's own
+        cgroup (verified test5 2026-09-02: limit=2GiB, usage tracks the
+        container's real footprint, independent of the host), so the value is
+        a truthful "current sandbox memory usage" for agent-facing context.
+
+        Uses a short TTL cache per container id to avoid exec cost on every
+        list/get call. Returns ``None`` when the file is unavailable or exec
+        fails, so callers can degrade gracefully.
+        """
+        container_id = getattr(container, "id", "") or ""
+        if not container_id:
+            return None
+        now = time.time()
+        with self._memory_usage_cache_lock:
+            cached = self._memory_usage_cache.get(container_id)
+            if cached is not None and now - cached[0] < self._memory_usage_cache_ttl_seconds:
+                return cached[1]
+        usage: Optional[int] = None
+        try:
+            # cgroup v2 优先：memory.current（单行纯数字）。
+            exec_result = container.exec_run(
+                "cat /sys/fs/cgroup/memory.current",
+                stdout=True,
+                stderr=True,
+            )
+            usage = self._parse_usage_from_exec(exec_result)
+            if usage is None:
+                # v1 兜底：memory.usage_in_bytes（docker exec 不走 shell，不能拼 ||）。
+                exec_result = container.exec_run(
+                    "cat /sys/fs/cgroup/memory/memory.usage_in_bytes",
+                    stdout=True,
+                    stderr=True,
+                )
+                usage = self._parse_usage_from_exec(exec_result)
+            if usage is not None:
+                with self._memory_usage_cache_lock:
+                    self._memory_usage_cache[container_id] = (now, usage)
+            return usage
+        except Exception:  # noqa: BLE001 - best-effort evidence only
+            logger.debug(
+                "Failed to read cgroup memory usage for container %s",
+                container_id,
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _parse_usage_from_exec(exec_result) -> Optional[int]:
+        """从 exec 结果解析内存占用字节数；exec 失败返回 None。"""
+        raw_exit = getattr(exec_result, "exit_code", None)
+        if raw_exit is None:
+            return None
+        try:
+            exit_code = int(raw_exit)
+        except (TypeError, ValueError):
+            return None
+        if exit_code != 0:
+            return None
+        output = getattr(exec_result, "output", b"")
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        raw = str(output).strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
     def _container_to_sandbox(self, container, sandbox_id: Optional[str] = None) -> Sandbox:
         labels = container.attrs.get("Config", {}).get("Labels") or {}
         resolved_id = sandbox_id or labels.get(SANDBOX_ID_LABEL)
@@ -635,6 +714,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         # State.OOMKilled 检测不到的，必须读 cgroup 计数。
         oom_killed = bool(status_section.get("OOMKilled", False))
         oom_kill_count = self._read_oom_kill_count(container)
+        memory_usage_bytes = self._read_memory_usage_bytes(container)
         host_memory = (container.attrs.get("HostConfig") or {}).get("Memory") or 0
 
         if running and not paused:
@@ -701,6 +781,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             last_transition_at=last_transition_at,
             oom_killed=oom_killed or None,
             oom_kill_count=oom_kill_count,
+            memory_usage_bytes=memory_usage_bytes,
             memory_limit_bytes=int(host_memory) if host_memory else None,
         )
         platform_spec = self._resolve_platform_for_container(container, labels)

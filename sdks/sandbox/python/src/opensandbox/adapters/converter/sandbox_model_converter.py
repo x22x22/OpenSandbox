@@ -660,6 +660,12 @@ class SandboxModelConverter:
             if isinstance(mlb_val, int):
                 memory_limit_bytes = mlb_val
 
+        memory_usage_bytes: int | None = None
+        if hasattr(api_status, "memory_usage_bytes"):
+            mub_val = api_status.memory_usage_bytes
+            if isinstance(mub_val, int):
+                memory_usage_bytes = mub_val
+
         return SandboxStatus(
             state=api_status.state,
             reason=reason,
@@ -669,6 +675,7 @@ class SandboxModelConverter:
             oom_kill_count=oom_kill_count,
             oom_event_at=oom_event_at,
             memory_limit_bytes=memory_limit_bytes,
+            memory_usage_bytes=memory_usage_bytes,
         )
 
     @staticmethod
