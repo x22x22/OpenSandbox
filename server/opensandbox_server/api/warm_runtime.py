@@ -42,6 +42,7 @@ class RuntimeProfileRequest(BaseModel):
     memory_mb: int = Field(gt=0)
     policy_version: str = Field(min_length=1)
     mount_policy: str = Field(min_length=1)
+    network_policy: str = ""
 
     def to_domain(self) -> RuntimeProfile:
         return RuntimeProfile(**self.model_dump())

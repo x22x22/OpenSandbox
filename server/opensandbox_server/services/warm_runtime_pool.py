@@ -36,6 +36,7 @@ class RuntimeProfile:
     memory_mb: int
     policy_version: str
     mount_policy: str
+    network_policy: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +264,7 @@ def _encode_state(runtimes: dict[str, WarmRuntime]) -> dict[str, Any]:
                 "memory_mb": runtime.profile.memory_mb,
                 "policy_version": runtime.profile.policy_version,
                 "mount_policy": runtime.profile.mount_policy,
+                "network_policy": runtime.profile.network_policy,
             },
             "state": runtime.state.value,
             "generation": runtime.generation,

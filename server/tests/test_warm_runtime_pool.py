@@ -111,3 +111,33 @@ def test_refill_uses_factory_and_is_bounded_by_target() -> None:
     assert pool.refill(profile(), 3, factory) == 3
     assert pool.refill(profile(), 3, factory) == 0
     assert created == 3
+
+
+def test_network_policy_is_part_of_profile_matching() -> None:
+    pool = WarmRuntimePool()
+    registered = RuntimeProfile(
+        node_id="node-a",
+        profile_id="medium",
+        image_digest="sha256:image-v1",
+        runtime_version="opencode-1.14.41",
+        cpu=4,
+        memory_mb=4096,
+        policy_version="policy-v1",
+        mount_policy="create-time-volume-attach",
+        network_policy="allow-all",
+    )
+    restricted = RuntimeProfile(
+        node_id="node-a",
+        profile_id="medium",
+        image_digest="sha256:image-v1",
+        runtime_version="opencode-1.14.41",
+        cpu=4,
+        memory_mb=4096,
+        policy_version="policy-v1",
+        mount_policy="create-time-volume-attach",
+        network_policy="egress-restricted",
+    )
+    pool.register_ready("runtime-1", registered)
+
+    assert pool.claim(restricted, binding()) is None
+    assert pool.claim(registered, binding()) is not None
