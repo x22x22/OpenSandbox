@@ -128,5 +128,15 @@ def warm_runtime_status() -> dict[str, object]:
 
 
 @router.post("/reconcile")
-def reconcile_warm_runtimes(request: ReconcileWarmRuntimeRequest) -> dict[str, int]:
-    return {"quarantined": _pool.reconcile(request.runtime_ids)}
+def reconcile_warm_runtimes(
+    request: ReconcileWarmRuntimeRequest,
+    force: Annotated[bool, Query()] = False,
+) -> dict[str, int]:
+    try:
+        quarantined = _pool.reconcile(request.runtime_ids, force=force)
+    except ValueError as exc:
+        # 保护触发：调用方只给了部分视图，拒绝大批量隔离健康 runtime。
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="reconcile_scope_too_broad"
+        ) from exc
+    return {"quarantined": quarantined}

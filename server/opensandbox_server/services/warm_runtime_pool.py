@@ -216,9 +216,27 @@ class WarmRuntimePool:
                     expired += 1
         return expired
 
-    def reconcile(self, actual_runtime_ids: set[str]) -> int:
+    def reconcile(
+        self,
+        actual_runtime_ids: set[str],
+        *,
+        force: bool = False,
+        max_quarantine: int = 50,
+    ) -> int:
         conflicts = 0
         with self._transaction():
+            pending = sum(
+                1
+                for runtime in self._runtimes.values()
+                if runtime.runtime_id not in actual_runtime_ids
+                and runtime.state
+                not in {WarmRuntimeState.QUARANTINE, WarmRuntimeState.DRAINING}
+            )
+            if pending > max_quarantine and not force:
+                raise ValueError(
+                    f"refusing to quarantine {pending} runtimes "
+                    f"(max_quarantine={max_quarantine}); pass force=True to proceed"
+                )
             for runtime in self._runtimes.values():
                 if runtime.runtime_id not in actual_runtime_ids and runtime.state not in {
                     WarmRuntimeState.QUARANTINE,

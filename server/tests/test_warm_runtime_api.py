@@ -179,3 +179,33 @@ def test_build_pool_selects_backend_from_env(tmp_path, monkeypatch):
 
     monkeypatch.delenv("WARM_RUNTIME_STORE")
     assert not isinstance(warm_runtime._build_pool(), SqliteWarmRuntimePool)
+
+
+def test_reconcile_rejects_scope_too_broad(monkeypatch):
+    """部分视图触发批量隔离保护时必须返回 409，而不是静默误杀。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(warm_runtime, "_pool", WarmRuntimePool())
+    app = FastAPI()
+    app.include_router(warm_runtime.router)
+    client = TestClient(app)
+
+    for i in range(60):
+        client.post(
+            "/warm-runtimes/register",
+            json={"runtime_id": f"runtime-{i}", "profile": _profile().model_dump()},
+        )
+
+    rejected = client.post(
+        "/warm-runtimes/reconcile", json={"runtime_ids": ["runtime-0"]}
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"] == "reconcile_scope_too_broad"
+    assert client.get("/warm-runtimes/status").json()["states"]["READY"] == 60
+
+    forced = client.post(
+        "/warm-runtimes/reconcile?force=true", json={"runtime_ids": ["runtime-0"]}
+    )
+    assert forced.status_code == 200
+    assert forced.json()["quarantined"] == 59

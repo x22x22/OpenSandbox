@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS warm_metrics (
 _METRIC_KEYS = ("pool_hits", "pool_misses", "cleanup_failures", "reconcile_conflicts")
 
 
+#: 单次 reconcile 默认允许的最大隔离数量，防止部分视图误杀健康 runtime。
+DEFAULT_MAX_RECONCILE_QUARANTINE = 50
+
+
 def _profile_key(profile: RuntimeProfile) -> str:
     """Stable identity for profile matching, including policy dimensions."""
     return json.dumps(
@@ -250,9 +254,24 @@ class SqliteWarmRuntimePool:
             )
             return cursor.rowcount or 0
 
-    def reconcile(self, actual_runtime_ids: set[str]) -> int:
+    def reconcile(
+        self,
+        actual_runtime_ids: set[str],
+        *,
+        force: bool = False,
+        max_quarantine: int = DEFAULT_MAX_RECONCILE_QUARANTINE,
+    ) -> int:
         conflicts = 0
         with self._lock, self._write():
+            # 先算影响面：reconcile 语义是"不在实际集合里的都隔离"，调用方若只提供
+            # 部分节点/部分页的数据，就会误杀其它节点的健康实例。因此默认对大批量
+            # 隔离做保护，必须显式 force 才允许。
+            pending = self._count_reconcile_candidates(actual_runtime_ids)
+            if pending > max_quarantine and not force:
+                raise ValueError(
+                    f"refusing to quarantine {pending} runtimes "
+                    f"(max_quarantine={max_quarantine}); pass force=True to proceed"
+                )
             if actual_runtime_ids:
                 placeholders = ",".join("?" * len(actual_runtime_ids))
                 cursor = self._conn.execute(
@@ -330,6 +349,29 @@ class SqliteWarmRuntimePool:
             "cleanupFailures": metrics.get("cleanup_failures", 0),
             "reconcileConflicts": metrics.get("reconcile_conflicts", 0),
         }
+
+    def _count_reconcile_candidates(self, actual_runtime_ids: set[str]) -> int:
+        if actual_runtime_ids:
+            placeholders = ",".join("?" * len(actual_runtime_ids))
+            row = self._conn.execute(
+                f"""
+                SELECT COUNT(*) AS c FROM warm_runtimes
+                WHERE runtime_id NOT IN ({placeholders}) AND state NOT IN (?, ?)
+                """,
+                (
+                    *sorted(actual_runtime_ids),
+                    WarmRuntimeState.QUARANTINE.value,
+                    WarmRuntimeState.DRAINING.value,
+                ),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM warm_runtimes WHERE state NOT IN (?, ?)
+                """,
+                (WarmRuntimeState.QUARANTINE.value, WarmRuntimeState.DRAINING.value),
+            ).fetchone()
+        return int(row["c"])
 
     # ------------------------------------------------------------------ helper
 

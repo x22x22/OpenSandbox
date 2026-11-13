@@ -254,3 +254,36 @@ def _lock_probe(args: tuple[str, str, str, float]) -> None:
         time.sleep(0.2)
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(f"out:{label}\n")
+
+
+def test_reconcile_refuses_mass_quarantine_from_partial_view(tmp_path) -> None:
+    """回归：只提供部分实际集合时不得批量隔离健康 runtime。"""
+    ledger = pool(tmp_path / "pool.json")
+    for i in range(60):
+        ledger.register_ready(f"runtime-{i}", profile())
+
+    # 只见到 1 个 runtime 的部分视图，其余 59 个不得被误杀
+    with pytest.raises(ValueError, match="refusing to quarantine"):
+        ledger.reconcile({"runtime-0"})
+
+    assert ledger.snapshot()["states"]["READY"] == 60
+    assert ledger.snapshot()["states"]["QUARANTINE"] == 0
+
+
+def test_reconcile_force_allows_mass_quarantine(tmp_path) -> None:
+    ledger = pool(tmp_path / "pool.json")
+    for i in range(60):
+        ledger.register_ready(f"runtime-{i}", profile())
+
+    quarantined = ledger.reconcile({"runtime-0"}, force=True)
+
+    assert quarantined == 59
+    assert ledger.get("runtime-0").state is WarmRuntimeState.READY
+
+
+def test_reconcile_small_diff_still_works_without_force(tmp_path) -> None:
+    ledger = pool(tmp_path / "pool.json")
+    ledger.register_ready("runtime-1", profile())
+    ledger.register_ready("runtime-2", profile())
+
+    assert ledger.reconcile({"runtime-1"}) == 1
