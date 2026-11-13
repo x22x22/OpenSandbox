@@ -187,6 +187,92 @@ class WarmRuntimePool:
             current.updated_at = issued_at
             return lease
 
+    def begin_claim(
+        self,
+        profile: RuntimeProfile,
+        binding: WorkspaceBinding,
+        *,
+        claim_ttl_seconds: float = 60.0,
+        now: float | None = None,
+    ) -> ClaimLease | None:
+        """第一阶段：READY -> CLAIMING，占用名额但尚未完成绑定。"""
+        issued_at = time.time() if now is None else now
+        with self._transaction():
+            current = next(
+                (
+                    runtime
+                    for runtime in self._runtimes.values()
+                    if runtime.state is WarmRuntimeState.READY
+                    and runtime.profile == profile
+                ),
+                None,
+            )
+            if current is None:
+                self.pool_misses += 1
+                return None
+            self.pool_hits += 1
+            current.generation += 1
+            lease = ClaimLease(
+                lease_id=f"lease-{uuid.uuid4().hex}",
+                runtime_id=current.runtime_id,
+                generation=current.generation,
+                fencing_token=uuid.uuid4().hex,
+                profile=profile,
+                binding=binding,
+                expires_at=issued_at + claim_ttl_seconds,
+            )
+            current.lease = lease
+            current.state = WarmRuntimeState.CLAIMING
+            current.updated_at = issued_at
+            return lease
+
+    def confirm_claim(
+        self,
+        lease_id: str,
+        fencing_token: str,
+        *,
+        lease_ttl_seconds: float = 300.0,
+        now: float | None = None,
+    ) -> ClaimLease:
+        """第二阶段：CLAIMING -> LEASED。"""
+        confirmed_at = time.time() if now is None else now
+        with self._transaction():
+            runtime = self._find_claiming_lease(lease_id)
+            if runtime.state is not WarmRuntimeState.CLAIMING:
+                raise ValueError("lease is not awaiting confirmation")
+            if runtime.lease is None or runtime.lease.fencing_token != fencing_token:
+                raise ValueError("fencing token mismatch")
+            confirmed = ClaimLease(
+                lease_id=runtime.lease.lease_id,
+                runtime_id=runtime.runtime_id,
+                generation=runtime.lease.generation,
+                fencing_token=fencing_token,
+                profile=runtime.lease.profile,
+                binding=runtime.lease.binding,
+                expires_at=confirmed_at + lease_ttl_seconds,
+            )
+            runtime.lease = confirmed
+            runtime.state = WarmRuntimeState.LEASED
+            runtime.updated_at = confirmed_at
+            return confirmed
+
+    def abort_claim(self, lease_id: str, fencing_token: str, *, cleanup_ok: bool) -> None:
+        """放弃 CLAIMING：cleanup 成功回 READY，否则进 QUARANTINE。"""
+        with self._transaction():
+            runtime = self._find_claiming_lease(lease_id)
+            if runtime.state is not WarmRuntimeState.CLAIMING:
+                raise ValueError("lease is not awaiting confirmation")
+            if runtime.lease is None or runtime.lease.fencing_token != fencing_token:
+                raise ValueError("fencing token mismatch")
+            if cleanup_ok:
+                runtime.generation += 1
+                runtime.lease = None
+                runtime.state = WarmRuntimeState.READY
+            else:
+                self.cleanup_failures += 1
+                runtime.state = WarmRuntimeState.QUARANTINE
+            runtime.updated_at = time.time()
+
     def release(self, lease_id: str, fencing_token: str, *, cleanup_ok: bool) -> None:
         with self._transaction():
             runtime = self._find_lease(lease_id)
@@ -219,7 +305,8 @@ class WarmRuntimePool:
         with self._transaction():
             for runtime in self._runtimes.values():
                 if (
-                    runtime.state is WarmRuntimeState.LEASED
+                    runtime.state
+                    in {WarmRuntimeState.LEASED, WarmRuntimeState.CLAIMING}
                     and runtime.lease is not None
                     and runtime.lease.expires_at <= current_time
                 ):
@@ -289,6 +376,13 @@ class WarmRuntimePool:
                 "cleanupFailures": self.cleanup_failures,
                 "reconcileConflicts": self.reconcile_conflicts,
             }
+
+    def _find_claiming_lease(self, lease_id: str) -> WarmRuntime:
+        """与 SQLite 实现保持同一错误语义：不存在或已结束都视为未在等待确认。"""
+        try:
+            return self._find_lease(lease_id)
+        except ValueError as exc:
+            raise ValueError("lease is not awaiting confirmation") from exc
 
     def _find_lease(self, lease_id: str) -> WarmRuntime:
         for runtime in self._runtimes.values():

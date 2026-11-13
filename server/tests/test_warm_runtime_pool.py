@@ -169,3 +169,42 @@ def test_reconcile_does_not_touch_draining_runtime() -> None:
 
     assert pool.reconcile(set()) == 0
     assert pool.get("runtime-1").state is WarmRuntimeState.DRAINING
+
+
+def test_memory_two_phase_claim_and_timeout() -> None:
+    pool = WarmRuntimePool()
+    pool.register_ready("runtime-1", profile())
+
+    pending = pool.begin_claim(profile(), binding(), claim_ttl_seconds=30)
+    assert pending is not None
+    assert pool.get("runtime-1").state is WarmRuntimeState.CLAIMING
+    assert pool.claim(profile(), binding()) is None
+
+    assert pool.expire_leases(now=pending.expires_at) == 1
+    assert pool.get("runtime-1").state is WarmRuntimeState.QUARANTINE
+
+
+def test_memory_confirm_then_release_round_trip() -> None:
+    pool = WarmRuntimePool()
+    pool.register_ready("runtime-1", profile())
+
+    pending = pool.begin_claim(profile(), binding())
+    assert pending is not None
+    confirmed = pool.confirm_claim(pending.lease_id, pending.fencing_token)
+    assert pool.get("runtime-1").state is WarmRuntimeState.LEASED
+
+    pool.release(confirmed.lease_id, confirmed.fencing_token, cleanup_ok=True)
+    assert pool.get("runtime-1").state is WarmRuntimeState.READY
+
+
+def test_memory_abort_claim_paths() -> None:
+    pool = WarmRuntimePool()
+    pool.register_ready("runtime-1", profile())
+
+    pending = pool.begin_claim(profile(), binding())
+    assert pending is not None
+    pool.abort_claim(pending.lease_id, pending.fencing_token, cleanup_ok=True)
+    assert pool.get("runtime-1").state is WarmRuntimeState.READY
+
+    with pytest.raises(ValueError, match="not awaiting confirmation"):
+        pool.abort_claim(pending.lease_id, pending.fencing_token, cleanup_ok=True)

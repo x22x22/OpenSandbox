@@ -203,3 +203,64 @@ def test_drain_survives_restart(tmp_path) -> None:
     restarted = SqliteWarmRuntimePool(path, lease_ttl_seconds=300)
     assert restarted.get("runtime-1").state is WarmRuntimeState.DRAINING
     assert restarted.reconcile(set()) == 0
+
+
+def test_two_phase_claim_goes_ready_claiming_leased(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+
+    pending = ledger.begin_claim(profile(), binding("s1"), claim_ttl_seconds=30)
+    assert pending is not None
+    assert ledger.get("runtime-1").state is WarmRuntimeState.CLAIMING
+    # CLAIMING 期间不可被再次领取
+    assert ledger.begin_claim(profile(), binding("s2")) is None
+
+    confirmed = ledger.confirm_claim(
+        pending.lease_id, pending.fencing_token, lease_ttl_seconds=300
+    )
+    assert confirmed.runtime_id == "runtime-1"
+    assert ledger.get("runtime-1").state is WarmRuntimeState.LEASED
+    assert confirmed.expires_at > pending.expires_at
+
+
+def test_claim_timeout_quarantines_unconfirmed_claim(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+    pending = ledger.begin_claim(profile(), binding(), claim_ttl_seconds=30)
+    assert pending is not None
+
+    assert ledger.expire_leases(now=pending.expires_at - 0.001) == 0
+    assert ledger.get("runtime-1").state is WarmRuntimeState.CLAIMING
+    assert ledger.expire_leases(now=pending.expires_at) == 1
+    assert ledger.get("runtime-1").state is WarmRuntimeState.QUARANTINE
+
+
+def test_abort_claim_returns_to_ready_or_quarantine(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+    ledger.register_ready("runtime-2", profile())
+
+    first = ledger.begin_claim(profile(), binding("s1"))
+    assert first is not None
+    ledger.abort_claim(first.lease_id, first.fencing_token, cleanup_ok=True)
+    assert ledger.get(first.runtime_id).state is WarmRuntimeState.READY
+
+    second = ledger.begin_claim(profile(), binding("s2"))
+    assert second is not None
+    ledger.abort_claim(second.lease_id, second.fencing_token, cleanup_ok=False)
+    assert ledger.get(second.runtime_id).state is WarmRuntimeState.QUARANTINE
+    assert ledger.snapshot()["cleanupFailures"] == 1
+
+
+def test_confirm_claim_rejects_wrong_fencing_and_double_confirm(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+    pending = ledger.begin_claim(profile(), binding())
+    assert pending is not None
+
+    with pytest.raises(ValueError, match="fencing"):
+        ledger.confirm_claim(pending.lease_id, "stale")
+
+    ledger.confirm_claim(pending.lease_id, pending.fencing_token)
+    with pytest.raises(ValueError, match="not awaiting confirmation"):
+        ledger.confirm_claim(pending.lease_id, pending.fencing_token)

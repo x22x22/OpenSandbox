@@ -198,6 +198,137 @@ class SqliteWarmRuntimePool:
             self._bump("pool_hits")
             return lease
 
+    def begin_claim(
+        self,
+        profile: RuntimeProfile,
+        binding: WorkspaceBinding,
+        *,
+        claim_ttl_seconds: float = 60.0,
+        now: float | None = None,
+    ) -> ClaimLease | None:
+        """第一阶段：READY -> CLAIMING，占用名额但尚未完成绑定。
+
+        用于「领取后还要做 create-time volume attach / readiness 探测」的路径。
+        调用方必须在 claim TTL 内 ``confirm_claim``，否则会被视为领取超时。
+        """
+        issued_at = time.time() if now is None else now
+        with self._lock, self._write():
+            row = self._conn.execute(
+                """
+                SELECT runtime_id, generation FROM warm_runtimes
+                WHERE profile_key = ? AND state = ?
+                ORDER BY updated_at, runtime_id LIMIT 1
+                """,
+                (_profile_key(profile), WarmRuntimeState.READY.value),
+            ).fetchone()
+            if row is None:
+                self._bump("pool_misses")
+                return None
+
+            generation = int(row["generation"]) + 1
+            lease = ClaimLease(
+                lease_id=f"lease-{uuid.uuid4().hex}",
+                runtime_id=row["runtime_id"],
+                generation=generation,
+                fencing_token=uuid.uuid4().hex,
+                profile=profile,
+                binding=binding,
+                expires_at=issued_at + claim_ttl_seconds,
+            )
+            self._conn.execute(
+                """
+                UPDATE warm_runtimes SET
+                    state = ?, generation = ?, lease_id = ?, fencing_token = ?,
+                    expires_at = ?, binding_json = ?, updated_at = ?
+                WHERE runtime_id = ?
+                """,
+                (
+                    WarmRuntimeState.CLAIMING.value,
+                    generation,
+                    lease.lease_id,
+                    lease.fencing_token,
+                    lease.expires_at,
+                    _binding_to_json(binding),
+                    issued_at,
+                    lease.runtime_id,
+                ),
+            )
+            self._bump("pool_hits")
+            return lease
+
+    def confirm_claim(
+        self,
+        lease_id: str,
+        fencing_token: str,
+        *,
+        lease_ttl_seconds: float = 300.0,
+        now: float | None = None,
+    ) -> ClaimLease:
+        """第二阶段：CLAIMING -> LEASED，绑定完成后才真正占用。"""
+        confirmed_at = time.time() if now is None else now
+        with self._lock, self._write():
+            row = self._conn.execute(
+                "SELECT * FROM warm_runtimes WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+            if row is None or row["state"] != WarmRuntimeState.CLAIMING.value:
+                raise ValueError("lease is not awaiting confirmation")
+            if row["fencing_token"] != fencing_token:
+                raise ValueError("fencing token mismatch")
+
+            expires_at = confirmed_at + lease_ttl_seconds
+            self._conn.execute(
+                """
+                UPDATE warm_runtimes SET state = ?, expires_at = ?, updated_at = ?
+                WHERE runtime_id = ?
+                """,
+                (WarmRuntimeState.LEASED.value, expires_at, confirmed_at, row["runtime_id"]),
+            )
+            return ClaimLease(
+                lease_id=lease_id,
+                runtime_id=row["runtime_id"],
+                generation=int(row["generation"]),
+                fencing_token=fencing_token,
+                profile=RuntimeProfile(**json.loads(row["profile_json"])),
+                binding=WorkspaceBinding(**json.loads(row["binding_json"])),
+                expires_at=expires_at,
+            )
+
+    def abort_claim(
+        self,
+        lease_id: str,
+        fencing_token: str,
+        *,
+        cleanup_ok: bool,
+    ) -> None:
+        """放弃 CLAIMING：cleanup 成功回 READY，否则进 QUARANTINE。"""
+        with self._lock, self._write():
+            row = self._conn.execute(
+                "SELECT runtime_id, state, fencing_token FROM warm_runtimes WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+            if row is None or row["state"] != WarmRuntimeState.CLAIMING.value:
+                raise ValueError("lease is not awaiting confirmation")
+            if row["fencing_token"] != fencing_token:
+                raise ValueError("fencing token mismatch")
+
+            if cleanup_ok:
+                self._conn.execute(
+                    """
+                    UPDATE warm_runtimes SET
+                        state = ?, generation = generation + 1,
+                        lease_id = NULL, fencing_token = NULL, expires_at = NULL,
+                        binding_json = NULL, updated_at = ?
+                    WHERE runtime_id = ?
+                    """,
+                    (WarmRuntimeState.READY.value, time.time(), row["runtime_id"]),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE warm_runtimes SET state = ?, updated_at = ? WHERE runtime_id = ?",
+                    (WarmRuntimeState.QUARANTINE.value, time.time(), row["runtime_id"]),
+                )
+                self._bump("cleanup_failures")
+
     def release(self, lease_id: str, fencing_token: str, *, cleanup_ok: bool) -> None:
         with self._lock, self._write():
             row = self._conn.execute(
@@ -264,12 +395,13 @@ class SqliteWarmRuntimePool:
             cursor = self._conn.execute(
                 """
                 UPDATE warm_runtimes SET state = ?, updated_at = ?
-                WHERE state = ? AND expires_at IS NOT NULL AND expires_at <= ?
+                WHERE state IN (?, ?) AND expires_at IS NOT NULL AND expires_at <= ?
                 """,
                 (
                     WarmRuntimeState.QUARANTINE.value,
                     current_time,
                     WarmRuntimeState.LEASED.value,
+                    WarmRuntimeState.CLAIMING.value,
                     current_time,
                 ),
             )
