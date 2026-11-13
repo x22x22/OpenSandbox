@@ -208,3 +208,40 @@ def test_memory_abort_claim_paths() -> None:
 
     with pytest.raises(ValueError, match="not awaiting confirmation"):
         pool.abort_claim(pending.lease_id, pending.fencing_token, cleanup_ok=True)
+
+
+def test_ready_runtime_carries_no_tenant_binding() -> None:
+    pool = WarmRuntimePool()
+    pool.register_ready("runtime-1", profile())
+    lease = pool.claim(profile(), binding())
+    assert lease is not None
+
+    pool.release(lease.lease_id, lease.fencing_token, cleanup_ok=True)
+
+    restored = pool.get("runtime-1")
+    assert restored.state is WarmRuntimeState.READY
+    assert restored.lease is None
+
+
+def test_quarantined_runtime_keeps_audit_but_is_not_reissuable() -> None:
+    pool = WarmRuntimePool()
+    pool.register_ready("runtime-1", profile())
+    lease = pool.claim(profile(), binding())
+    assert lease is not None
+    pool.release(lease.lease_id, lease.fencing_token, cleanup_ok=False)
+
+    assert pool.claim(profile(), binding()) is None
+    assert pool.get("runtime-1").state is WarmRuntimeState.QUARANTINE
+
+
+def test_successive_tenants_get_distinct_fencing_tokens() -> None:
+    pool = WarmRuntimePool()
+    pool.register_ready("runtime-1", profile())
+    first = pool.claim(profile(), binding())
+    assert first is not None
+    pool.release(first.lease_id, first.fencing_token, cleanup_ok=True)
+    second = pool.claim(profile(), binding())
+    assert second is not None
+
+    assert second.generation > first.generation
+    assert second.fencing_token != first.fencing_token

@@ -264,3 +264,69 @@ def test_confirm_claim_rejects_wrong_fencing_and_double_confirm(tmp_path) -> Non
     ledger.confirm_claim(pending.lease_id, pending.fencing_token)
     with pytest.raises(ValueError, match="not awaiting confirmation"):
         ledger.confirm_claim(pending.lease_id, pending.fencing_token)
+
+
+def test_ready_runtime_carries_no_tenant_binding_after_release(tmp_path) -> None:
+    """回归：回到 READY 的 runtime 不得残留上一个租户的 binding 信息。"""
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+    lease = ledger.claim(profile(), binding("tenant-a-session"))
+    assert lease is not None
+
+    ledger.release(lease.lease_id, lease.fencing_token, cleanup_ok=True)
+
+    restored = ledger.get("runtime-1")
+    assert restored.state is WarmRuntimeState.READY
+    assert restored.lease is None
+    row = ledger._conn.execute(
+        "SELECT lease_id, fencing_token, binding_json, expires_at FROM warm_runtimes"
+    ).fetchone()
+    assert row["lease_id"] is None
+    assert row["fencing_token"] is None
+    assert row["binding_json"] is None
+    assert row["expires_at"] is None
+
+
+def test_aborted_claim_leaves_no_tenant_binding(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+    pending = ledger.begin_claim(profile(), binding("tenant-b-session"))
+    assert pending is not None
+
+    ledger.abort_claim(pending.lease_id, pending.fencing_token, cleanup_ok=True)
+
+    row = ledger._conn.execute(
+        "SELECT lease_id, binding_json FROM warm_runtimes"
+    ).fetchone()
+    assert row["lease_id"] is None
+    assert row["binding_json"] is None
+
+
+def test_quarantined_runtime_is_never_handed_to_another_binding(tmp_path) -> None:
+    """隔离实例只保留审计信息，绝不再发放给新的租户。"""
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+    lease = ledger.claim(profile(), binding("tenant-a"))
+    assert lease is not None
+    ledger.release(lease.lease_id, lease.fencing_token, cleanup_ok=False)
+
+    assert ledger.claim(profile(), binding("tenant-b")) is None
+    with pytest.raises(ValueError, match="not active"):
+        ledger.release(lease.lease_id, lease.fencing_token, cleanup_ok=True)
+
+
+def test_two_consecutive_tenants_get_distinct_generations(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+
+    first = ledger.claim(profile(), binding("tenant-a"))
+    assert first is not None
+    ledger.release(first.lease_id, first.fencing_token, cleanup_ok=True)
+    second = ledger.claim(profile(), binding("tenant-b"))
+    assert second is not None
+
+    assert second.generation > first.generation
+    assert second.fencing_token != first.fencing_token
+    # 旧 fencing 不能作用于新租约
+    with pytest.raises(ValueError, match="fencing"):
+        ledger.release(second.lease_id, first.fencing_token, cleanup_ok=True)
