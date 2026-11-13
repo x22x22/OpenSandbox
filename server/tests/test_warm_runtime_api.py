@@ -66,3 +66,43 @@ def test_warm_runtime_api_pool_miss_and_reconcile(monkeypatch):
     assert reconcile_warm_runtimes(ReconcileWarmRuntimeRequest(runtime_ids=set())) == {
         "quarantined": 0
     }
+
+
+def test_warm_runtime_routes_register_through_fastapi(monkeypatch):
+    """走真实 FastAPI 路由注册，防止 204 响应体断言在 CI 才暴露。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(warm_runtime, "_pool", WarmRuntimePool())
+    app = FastAPI()
+    app.include_router(warm_runtime.router)
+    client = TestClient(app)
+
+    registered = client.post(
+        "/warm-runtimes/register",
+        json={"runtime_id": "runtime-1", "profile": _profile().model_dump()},
+    )
+    assert registered.status_code == 204
+    assert registered.content == b""
+
+    claimed = client.post(
+        "/warm-runtimes/claim",
+        json={"profile": _profile().model_dump(), "binding": _binding().model_dump()},
+    )
+    assert claimed.status_code == 200
+    lease = claimed.json()["lease"]
+    assert claimed.json()["poolHit"] is True
+
+    stale = client.post(
+        f"/warm-runtimes/leases/{lease['leaseId']}/release",
+        params={"fencing_token": "stale", "cleanupOk": "true"},
+    )
+    assert stale.status_code == 409
+
+    released = client.post(
+        f"/warm-runtimes/leases/{lease['leaseId']}/release",
+        params={"fencing_token": lease["fencingToken"], "cleanupOk": "true"},
+    )
+    assert released.status_code == 204
+    assert released.content == b""
+    assert client.get("/warm-runtimes/status").json()["states"]["READY"] == 1

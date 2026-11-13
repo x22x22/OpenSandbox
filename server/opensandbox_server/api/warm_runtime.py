@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 
 from opensandbox_server.services.warm_runtime_pool import (
@@ -63,8 +63,9 @@ class ReconcileWarmRuntimeRequest(BaseModel):
 
 
 @router.post("/register", status_code=status.HTTP_204_NO_CONTENT)
-def register_warm_runtime(request: RegisterWarmRuntimeRequest) -> None:
+def register_warm_runtime(request: RegisterWarmRuntimeRequest) -> Response:
     _pool.register_ready(request.runtime_id, request.profile.to_domain())
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/claim")
@@ -89,11 +90,12 @@ def release_warm_runtime(
     lease_id: str,
     fencing_token: Annotated[str, Query(min_length=1)],
     cleanup_ok: Annotated[bool, Query(alias="cleanupOk")],
-) -> None:
+) -> Response:
     try:
         _pool.release(lease_id, fencing_token, cleanup_ok=cleanup_ok)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="lease_conflict") from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/status")
