@@ -11,7 +11,10 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from opensandbox_server.services.warm_runtime_store import WarmRuntimeStore
 
 
 class WarmRuntimeState(str, Enum):
@@ -70,14 +73,40 @@ class WarmRuntime:
 class WarmRuntimePool:
     """Thread-safe ledger with atomic claim and bounded lifecycle transitions."""
 
-    def __init__(self, *, lease_ttl_seconds: float = 300.0) -> None:
+    def __init__(
+        self,
+        *,
+        lease_ttl_seconds: float = 300.0,
+        store: "WarmRuntimeStore | None" = None,
+    ) -> None:
         self.lease_ttl_seconds = lease_ttl_seconds
-        self._runtimes: dict[str, WarmRuntime] = {}
+        self._store = store
         self._lock = RLock()
+        self._runtimes: dict[str, WarmRuntime] = {}
         self.pool_hits = 0
         self.pool_misses = 0
         self.cleanup_failures = 0
         self.reconcile_conflicts = 0
+        if store is not None:
+            runtimes, metrics = store.load()
+            self._runtimes = runtimes
+            self.pool_hits = metrics.get("pool_hits", 0)
+            self.pool_misses = metrics.get("pool_misses", 0)
+            self.cleanup_failures = metrics.get("cleanup_failures", 0)
+            self.reconcile_conflicts = metrics.get("reconcile_conflicts", 0)
+
+    def _persist(self) -> None:
+        if self._store is None:
+            return
+        self._store.save(
+            self._runtimes,
+            {
+                "pool_hits": self.pool_hits,
+                "pool_misses": self.pool_misses,
+                "cleanup_failures": self.cleanup_failures,
+                "reconcile_conflicts": self.reconcile_conflicts,
+            },
+        )
 
     def register_ready(self, runtime_id: str, profile: RuntimeProfile) -> None:
         with self._lock:
@@ -91,6 +120,7 @@ class WarmRuntimePool:
                 generation=generation,
                 updated_at=time.time(),
             )
+            self._persist()
 
     def claim(
         self,
@@ -111,6 +141,7 @@ class WarmRuntimePool:
             )
             if current is None:
                 self.pool_misses += 1
+                self._persist()
                 return None
             self.pool_hits += 1
             current.state = WarmRuntimeState.CLAIMING
@@ -128,6 +159,7 @@ class WarmRuntimePool:
             current.lease = lease
             current.state = WarmRuntimeState.LEASED
             current.updated_at = issued_at
+            self._persist()
             return lease
 
     def release(self, lease_id: str, fencing_token: str, *, cleanup_ok: bool) -> None:
@@ -144,6 +176,7 @@ class WarmRuntimePool:
                 self.cleanup_failures += 1
                 runtime.state = WarmRuntimeState.QUARANTINE
             runtime.updated_at = time.time()
+            self._persist()
 
     def expire_leases(self, *, now: float | None = None) -> int:
         current_time = time.time() if now is None else now
@@ -157,6 +190,8 @@ class WarmRuntimePool:
                 ):
                     runtime.state = WarmRuntimeState.QUARANTINE
                     expired += 1
+            if expired:
+                self._persist()
         return expired
 
     def reconcile(self, actual_runtime_ids: set[str]) -> int:
@@ -170,6 +205,8 @@ class WarmRuntimePool:
                     runtime.state = WarmRuntimeState.QUARANTINE
                     conflicts += 1
             self.reconcile_conflicts += conflicts
+            if conflicts:
+                self._persist()
         return conflicts
 
     def refill(self, profile: RuntimeProfile, target: int, factory: Callable[[], str]) -> int:
@@ -183,6 +220,8 @@ class WarmRuntimePool:
                 self.register_ready(factory(), profile)
                 ready += 1
                 created += 1
+            if created:
+                self._persist()
         return created
 
     def get(self, runtime_id: str) -> WarmRuntime:
@@ -207,3 +246,70 @@ class WarmRuntimePool:
             if runtime.lease and runtime.lease.lease_id == lease_id:
                 return runtime
         raise ValueError("lease is not active")
+
+
+def _encode_state(runtimes: dict[str, WarmRuntime]) -> dict[str, Any]:
+    """Serialize ledger state to primitives (no secrets, no host paths)."""
+    encoded: dict[str, Any] = {}
+    for runtime_id, runtime in runtimes.items():
+        lease = runtime.lease
+        encoded[runtime_id] = {
+            "profile": {
+                "node_id": runtime.profile.node_id,
+                "profile_id": runtime.profile.profile_id,
+                "image_digest": runtime.profile.image_digest,
+                "runtime_version": runtime.profile.runtime_version,
+                "cpu": runtime.profile.cpu,
+                "memory_mb": runtime.profile.memory_mb,
+                "policy_version": runtime.profile.policy_version,
+                "mount_policy": runtime.profile.mount_policy,
+            },
+            "state": runtime.state.value,
+            "generation": runtime.generation,
+            "updated_at": runtime.updated_at,
+            "lease": None
+            if lease is None
+            else {
+                "lease_id": lease.lease_id,
+                "generation": lease.generation,
+                "fencing_token": lease.fencing_token,
+                "expires_at": lease.expires_at,
+                "binding": {
+                    "tenant_id": lease.binding.tenant_id,
+                    "project_id": lease.binding.project_id,
+                    "session_id": lease.binding.session_id,
+                    "workspace_volume_id": lease.binding.workspace_volume_id,
+                    "runtime_data_volume_id": lease.binding.runtime_data_volume_id,
+                    "artifacts_volume_id": lease.binding.artifacts_volume_id,
+                    "mount_signature": lease.binding.mount_signature,
+                },
+            },
+        }
+    return encoded
+
+
+def _decode_state(encoded: dict[str, Any]) -> dict[str, WarmRuntime]:
+    runtimes: dict[str, WarmRuntime] = {}
+    for runtime_id, payload in encoded.items():
+        profile = RuntimeProfile(**payload["profile"])
+        lease_payload = payload.get("lease")
+        lease = None
+        if lease_payload:
+            lease = ClaimLease(
+                lease_id=lease_payload["lease_id"],
+                runtime_id=runtime_id,
+                generation=int(lease_payload["generation"]),
+                fencing_token=lease_payload["fencing_token"],
+                profile=profile,
+                binding=WorkspaceBinding(**lease_payload["binding"]),
+                expires_at=float(lease_payload["expires_at"]),
+            )
+        runtimes[runtime_id] = WarmRuntime(
+            runtime_id=runtime_id,
+            profile=profile,
+            state=WarmRuntimeState(payload["state"]),
+            generation=int(payload["generation"]),
+            lease=lease,
+            updated_at=float(payload.get("updated_at", 0.0)),
+        )
+    return runtimes

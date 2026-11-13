@@ -6,6 +6,7 @@ attachment remain in Docker/Kubernetes services and are intentionally separate.
 
 from __future__ import annotations
 
+import os
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
@@ -16,9 +17,20 @@ from opensandbox_server.services.warm_runtime_pool import (
     WarmRuntimePool,
     WorkspaceBinding,
 )
+from opensandbox_server.services.warm_runtime_store import JsonFileWarmRuntimeStore
 
 router = APIRouter(prefix="/warm-runtimes", tags=["Warm Runtimes"])
-_pool = WarmRuntimePool()
+
+
+def _build_pool() -> WarmRuntimePool:
+    """Use a durable ledger when a store path is configured, else in-memory."""
+    store_path = (os.getenv("WARM_RUNTIME_STORE_PATH") or "").strip()
+    if not store_path:
+        return WarmRuntimePool()
+    return WarmRuntimePool(store=JsonFileWarmRuntimeStore(store_path))
+
+
+_pool = _build_pool()
 
 
 class RuntimeProfileRequest(BaseModel):
