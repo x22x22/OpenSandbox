@@ -141,3 +141,31 @@ def test_network_policy_is_part_of_profile_matching() -> None:
 
     assert pool.claim(restricted, binding()) is None
     assert pool.claim(registered, binding()) is not None
+
+
+def test_drain_removes_runtime_from_claimable_set() -> None:
+    pool = WarmRuntimePool()
+    pool.register_ready("runtime-1", profile())
+
+    pool.drain("runtime-1")
+
+    assert pool.get("runtime-1").state is WarmRuntimeState.DRAINING
+    assert pool.claim(profile(), binding()) is None
+
+
+def test_drain_leased_runtime_is_refused() -> None:
+    pool = WarmRuntimePool()
+    pool.register_ready("runtime-1", profile())
+    assert pool.claim(profile(), binding()) is not None
+
+    with pytest.raises(ValueError, match="cannot drain"):
+        pool.drain("runtime-1")
+
+
+def test_reconcile_does_not_touch_draining_runtime() -> None:
+    pool = WarmRuntimePool()
+    pool.register_ready("runtime-1", profile())
+    pool.drain("runtime-1")
+
+    assert pool.reconcile(set()) == 0
+    assert pool.get("runtime-1").state is WarmRuntimeState.DRAINING

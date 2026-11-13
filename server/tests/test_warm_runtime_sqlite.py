@@ -171,3 +171,35 @@ def test_snapshot_does_not_scale_with_row_count(tmp_path) -> None:
         "SELECT state, COUNT(*) FROM warm_runtimes GROUP BY state"
     ).fetchall()
     assert len(rows) == 1
+
+
+def test_drain_removes_runtime_from_claimable_set(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+
+    ledger.drain("runtime-1")
+
+    assert ledger.get("runtime-1").state is WarmRuntimeState.DRAINING
+    assert ledger.claim(profile(), binding()) is None
+
+
+def test_drain_refuses_leased_and_unknown(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("runtime-1", profile())
+    assert ledger.claim(profile(), binding()) is not None
+
+    with pytest.raises(ValueError, match="cannot drain"):
+        ledger.drain("runtime-1")
+    with pytest.raises(KeyError):
+        ledger.drain("missing")
+
+
+def test_drain_survives_restart(tmp_path) -> None:
+    path = tmp_path / "pool.db"
+    first = SqliteWarmRuntimePool(path, lease_ttl_seconds=300)
+    first.register_ready("runtime-1", profile())
+    first.drain("runtime-1")
+
+    restarted = SqliteWarmRuntimePool(path, lease_ttl_seconds=300)
+    assert restarted.get("runtime-1").state is WarmRuntimeState.DRAINING
+    assert restarted.reconcile(set()) == 0

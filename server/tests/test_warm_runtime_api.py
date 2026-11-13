@@ -209,3 +209,36 @@ def test_reconcile_rejects_scope_too_broad(monkeypatch):
     )
     assert forced.status_code == 200
     assert forced.json()["quarantined"] == 59
+
+
+def test_drain_endpoint(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(warm_runtime, "_pool", WarmRuntimePool())
+    app = FastAPI()
+    app.include_router(warm_runtime.router)
+    client = TestClient(app)
+
+    client.post(
+        "/warm-runtimes/register",
+        json={"runtime_id": "runtime-1", "profile": _profile().model_dump()},
+    )
+
+    drained = client.post("/warm-runtimes/runtime-1/drain")
+    assert drained.status_code == 204
+    assert client.get("/warm-runtimes/status").json()["states"]["DRAINING"] == 1
+
+    claimed = client.post(
+        "/warm-runtimes/claim",
+        json={"profile": _profile().model_dump(), "binding": _binding().model_dump()},
+    )
+    assert claimed.json()["poolHit"] is False
+
+    again = client.post("/warm-runtimes/runtime-1/drain")
+    assert again.status_code == 409
+    assert again.json()["detail"] == "runtime_not_drainable"
+
+    missing = client.post("/warm-runtimes/missing/drain")
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "runtime_not_found"

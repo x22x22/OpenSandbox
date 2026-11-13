@@ -122,6 +122,22 @@ def release_warm_runtime(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.post("/{runtime_id}/drain", status_code=status.HTTP_204_NO_CONTENT)
+def drain_warm_runtime(runtime_id: str) -> Response:
+    """让空闲 runtime 退出可领取集合（READY -> DRAINING）。"""
+    try:
+        _pool.drain(runtime_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="runtime_not_found"
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="runtime_not_drainable"
+        ) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("/status")
 def warm_runtime_status() -> dict[str, object]:
     return _pool.snapshot()

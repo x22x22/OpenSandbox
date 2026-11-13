@@ -202,6 +202,17 @@ class WarmRuntimePool:
                 runtime.state = WarmRuntimeState.QUARANTINE
             runtime.updated_at = time.time()
 
+    def drain(self, runtime_id: str) -> None:
+        """把空闲 runtime 置为 DRAINING，使其退出可领取集合（仅 READY 可 drain）。"""
+        with self._transaction():
+            runtime = self._runtimes.get(runtime_id)
+            if runtime is None:
+                raise KeyError(runtime_id)
+            if runtime.state is not WarmRuntimeState.READY:
+                raise ValueError(f"cannot drain runtime in state {runtime.state.value}")
+            runtime.state = WarmRuntimeState.DRAINING
+            runtime.updated_at = time.time()
+
     def expire_leases(self, *, now: float | None = None) -> int:
         current_time = time.time() if now is None else now
         expired = 0

@@ -237,6 +237,27 @@ class SqliteWarmRuntimePool:
                 )
                 self._bump("cleanup_failures")
 
+    def drain(self, runtime_id: str) -> None:
+        """把空闲 runtime 置为 DRAINING，使其退出可领取集合。
+
+        只允许 READY → DRAINING：正在被租用的 runtime 不能被抽干，否则会中断
+        用户的会话；此时应等 release 之后再 drain。
+        """
+        with self._lock, self._write():
+            row = self._conn.execute(
+                "SELECT state FROM warm_runtimes WHERE runtime_id = ?", (runtime_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(runtime_id)
+            if row["state"] != WarmRuntimeState.READY.value:
+                raise ValueError(
+                    f"cannot drain runtime in state {row['state']}"
+                )
+            self._conn.execute(
+                "UPDATE warm_runtimes SET state = ?, updated_at = ? WHERE runtime_id = ?",
+                (WarmRuntimeState.DRAINING.value, time.time(), runtime_id),
+            )
+
     def expire_leases(self, *, now: float | None = None) -> int:
         current_time = time.time() if now is None else now
         with self._lock, self._write():
