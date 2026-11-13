@@ -330,3 +330,55 @@ def test_two_consecutive_tenants_get_distinct_generations(tmp_path) -> None:
     # 旧 fencing 不能作用于新租约
     with pytest.raises(ValueError, match="fencing"):
         ledger.release(second.lease_id, first.fencing_token, cleanup_ok=True)
+
+
+def test_bind_runtime_records_real_container_id(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("slot-1", profile())
+    pending = ledger.begin_claim(profile(), binding("s1"))
+    assert pending is not None
+
+    ledger.bind_runtime(pending.lease_id, pending.fencing_token, "container-abc")
+    assert ledger.get("slot-1").bound_runtime_id == "container-abc"
+
+    confirmed = ledger.confirm_claim(pending.lease_id, pending.fencing_token)
+    assert confirmed.runtime_id == "slot-1"
+    assert ledger.get("slot-1").bound_runtime_id == "container-abc"
+
+
+def test_bind_runtime_rejects_stale_fencing_and_bad_state(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("slot-1", profile())
+    pending = ledger.begin_claim(profile(), binding())
+    assert pending is not None
+
+    with pytest.raises(ValueError, match="fencing"):
+        ledger.bind_runtime(pending.lease_id, "stale", "container-x")
+    with pytest.raises(ValueError, match="required"):
+        ledger.bind_runtime(pending.lease_id, pending.fencing_token, "")
+    with pytest.raises(ValueError, match="not active"):
+        ledger.bind_runtime("missing-lease", "fence", "container-x")
+
+
+def test_release_clears_bound_runtime_id(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("slot-1", profile())
+    lease = ledger.claim(profile(), binding())
+    assert lease is not None
+    ledger.bind_runtime(lease.lease_id, lease.fencing_token, "container-abc")
+
+    ledger.release(lease.lease_id, lease.fencing_token, cleanup_ok=True)
+
+    assert ledger.get("slot-1").bound_runtime_id is None
+
+
+def test_bound_runtime_id_survives_restart(tmp_path) -> None:
+    path = tmp_path / "pool.db"
+    first = SqliteWarmRuntimePool(path, lease_ttl_seconds=300)
+    first.register_ready("slot-1", profile())
+    lease = first.claim(profile(), binding())
+    assert lease is not None
+    first.bind_runtime(lease.lease_id, lease.fencing_token, "container-abc")
+
+    restarted = SqliteWarmRuntimePool(path, lease_ttl_seconds=300)
+    assert restarted.get("slot-1").bound_runtime_id == "container-abc"

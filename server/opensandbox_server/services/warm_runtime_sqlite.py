@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS warm_runtimes (
     fencing_token TEXT,
     expires_at REAL,
     binding_json TEXT,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    bound_runtime_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_warm_ready
     ON warm_runtimes (profile_key, state, updated_at);
@@ -106,6 +107,15 @@ class SqliteWarmRuntimePool:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # 兼容既有库：老库没有 bound_runtime_id 列，补上。
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(warm_runtimes)")
+            }
+            if "bound_runtime_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE warm_runtimes ADD COLUMN bound_runtime_id TEXT"
+                )
             for key in _METRIC_KEYS:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO warm_metrics (key, value) VALUES (?, 0)", (key,)
@@ -317,7 +327,7 @@ class SqliteWarmRuntimePool:
                     UPDATE warm_runtimes SET
                         state = ?, generation = generation + 1,
                         lease_id = NULL, fencing_token = NULL, expires_at = NULL,
-                        binding_json = NULL, updated_at = ?
+                        binding_json = NULL, bound_runtime_id = NULL, updated_at = ?
                     WHERE runtime_id = ?
                     """,
                     (WarmRuntimeState.READY.value, time.time(), row["runtime_id"]),
@@ -349,7 +359,7 @@ class SqliteWarmRuntimePool:
                     UPDATE warm_runtimes SET
                         state = ?, generation = generation + 1,
                         lease_id = NULL, fencing_token = NULL, expires_at = NULL,
-                        binding_json = NULL, updated_at = ?
+                        binding_json = NULL, bound_runtime_id = NULL, updated_at = ?
                     WHERE runtime_id = ?
                     """,
                     (WarmRuntimeState.READY.value, time.time(), row["runtime_id"]),
@@ -367,6 +377,34 @@ class SqliteWarmRuntimePool:
                     ),
                 )
                 self._bump("cleanup_failures")
+
+    def bind_runtime(
+        self, lease_id: str, fencing_token: str, bound_runtime_id: str
+    ) -> None:
+        """把租约槽位绑定到真实创建出来的容器 id。"""
+        if not bound_runtime_id:
+            raise ValueError("bound runtime id is required")
+        with self._lock, self._write():
+            row = self._conn.execute(
+                "SELECT runtime_id, state, fencing_token FROM warm_runtimes WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("lease is not active")
+            if row["fencing_token"] != fencing_token:
+                raise ValueError("fencing token mismatch")
+            if row["state"] not in (
+                WarmRuntimeState.CLAIMING.value,
+                WarmRuntimeState.LEASED.value,
+            ):
+                raise ValueError(f"cannot bind runtime in state {row['state']}")
+            self._conn.execute(
+                """
+                UPDATE warm_runtimes SET bound_runtime_id = ?, updated_at = ?
+                WHERE runtime_id = ?
+                """,
+                (bound_runtime_id, time.time(), row["runtime_id"]),
+            )
 
     def drain(self, runtime_id: str) -> None:
         """把空闲 runtime 置为 DRAINING，使其退出可领取集合。
@@ -573,4 +611,5 @@ def _row_to_runtime(row: sqlite3.Row) -> WarmRuntime:
         generation=int(row["generation"]),
         lease=lease,
         updated_at=float(row["updated_at"]),
+        bound_runtime_id=row["bound_runtime_id"],
     )

@@ -166,6 +166,22 @@ def abort_warm_runtime_claim(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.post("/leases/{lease_id}/bind", status_code=status.HTTP_204_NO_CONTENT)
+def bind_warm_runtime(
+    lease_id: str,
+    fencing_token: Annotated[str, Query(min_length=1)],
+    runtime_id: Annotated[str, Query(min_length=1)],
+) -> Response:
+    """把已领取的槽位绑定到真实创建出来的容器 id。"""
+    try:
+        _pool.bind_runtime(lease_id, fencing_token, runtime_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="lease_not_bindable"
+        ) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.post("/{runtime_id}/drain", status_code=status.HTTP_204_NO_CONTENT)
 def drain_warm_runtime(runtime_id: str) -> Response:
     """让空闲 runtime 退出可领取集合（READY -> DRAINING）。"""

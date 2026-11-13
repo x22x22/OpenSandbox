@@ -70,6 +70,8 @@ class WarmRuntime:
     generation: int = 0
     lease: ClaimLease | None = None
     updated_at: float = 0.0
+    #: 槽位实际绑定的容器/沙箱 id。暖模板本身没有容器，领取后创建出来再回填。
+    bound_runtime_id: str | None = None
 
 
 class WarmRuntimePool:
@@ -288,6 +290,30 @@ class WarmRuntimePool:
                 runtime.state = WarmRuntimeState.QUARANTINE
             runtime.updated_at = time.time()
 
+    def bind_runtime(
+        self, lease_id: str, fencing_token: str, bound_runtime_id: str
+    ) -> None:
+        """把租约槽位绑定到真实创建出来的容器 id。
+
+        暖模板没有容器，领取后由调用方创建租户容器，再把它的 id 回填到这里，
+        这样 release/cleanup 才知道该清理哪一个真实运行时。
+        """
+        if not bound_runtime_id:
+            raise ValueError("bound runtime id is required")
+        with self._transaction():
+            runtime = self._find_claiming_lease(lease_id)
+            if runtime.lease is None or runtime.lease.fencing_token != fencing_token:
+                raise ValueError("fencing token mismatch")
+            if runtime.state not in {
+                WarmRuntimeState.CLAIMING,
+                WarmRuntimeState.LEASED,
+            }:
+                raise ValueError(
+                    f"cannot bind runtime in state {runtime.state.value}"
+                )
+            runtime.bound_runtime_id = bound_runtime_id
+            runtime.updated_at = time.time()
+
     def drain(self, runtime_id: str) -> None:
         """把空闲 runtime 置为 DRAINING，使其退出可领取集合（仅 READY 可 drain）。"""
         with self._transaction():
@@ -411,6 +437,7 @@ def _encode_state(runtimes: dict[str, WarmRuntime]) -> dict[str, Any]:
             "state": runtime.state.value,
             "generation": runtime.generation,
             "updated_at": runtime.updated_at,
+            "bound_runtime_id": runtime.bound_runtime_id,
             "lease": None
             if lease is None
             else {
@@ -455,5 +482,6 @@ def _decode_state(encoded: dict[str, Any]) -> dict[str, WarmRuntime]:
             generation=int(payload["generation"]),
             lease=lease,
             updated_at=float(payload.get("updated_at", 0.0)),
+            bound_runtime_id=payload.get("bound_runtime_id"),
         )
     return runtimes
