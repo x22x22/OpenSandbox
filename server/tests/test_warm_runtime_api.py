@@ -242,3 +242,75 @@ def test_drain_endpoint(monkeypatch):
     missing = client.post("/warm-runtimes/missing/drain")
     assert missing.status_code == 404
     assert missing.json()["detail"] == "runtime_not_found"
+
+
+def test_two_phase_claim_endpoints(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(warm_runtime, "_pool", WarmRuntimePool())
+    app = FastAPI()
+    app.include_router(warm_runtime.router)
+    client = TestClient(app)
+
+    client.post(
+        "/warm-runtimes/register",
+        json={"runtime_id": "runtime-1", "profile": _profile().model_dump()},
+    )
+
+    begun = client.post(
+        "/warm-runtimes/begin-claim",
+        json={"profile": _profile().model_dump(), "binding": _binding().model_dump()},
+    )
+    assert begun.status_code == 200
+    assert begun.json()["poolHit"] is True
+    lease = begun.json()["lease"]
+    assert client.get("/warm-runtimes/status").json()["states"]["CLAIMING"] == 1
+
+    # CLAIMING 期间不可被再次领取
+    again = client.post(
+        "/warm-runtimes/begin-claim",
+        json={"profile": _profile().model_dump(), "binding": _binding().model_dump()},
+    )
+    assert again.json()["poolHit"] is False
+
+    stale = client.post(
+        f"/warm-runtimes/leases/{lease['leaseId']}/confirm",
+        params={"fencing_token": "stale"},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"] == "lease_not_confirmable"
+
+    confirmed = client.post(
+        f"/warm-runtimes/leases/{lease['leaseId']}/confirm",
+        params={"fencing_token": lease["fencingToken"]},
+    )
+    assert confirmed.status_code == 200
+    assert client.get("/warm-runtimes/status").json()["states"]["LEASED"] == 1
+
+
+def test_abort_claim_endpoint(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(warm_runtime, "_pool", WarmRuntimePool())
+    app = FastAPI()
+    app.include_router(warm_runtime.router)
+    client = TestClient(app)
+
+    client.post(
+        "/warm-runtimes/register",
+        json={"runtime_id": "runtime-1", "profile": _profile().model_dump()},
+    )
+    begun = client.post(
+        "/warm-runtimes/begin-claim",
+        json={"profile": _profile().model_dump(), "binding": _binding().model_dump()},
+    )
+    lease = begun.json()["lease"]
+
+    aborted = client.post(
+        f"/warm-runtimes/leases/{lease['leaseId']}/abort",
+        params={"fencing_token": lease["fencingToken"], "cleanupOk": "true"},
+    )
+    assert aborted.status_code == 204
+    assert client.get("/warm-runtimes/status").json()["states"]["READY"] == 1

@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 
 from opensandbox_server.services.warm_runtime_pool import (
+    ClaimLease,
     RuntimeProfile,
     WarmRuntimePool,
     WorkspaceBinding,
@@ -21,6 +22,16 @@ from opensandbox_server.services.warm_runtime_sqlite import SqliteWarmRuntimePoo
 from opensandbox_server.services.warm_runtime_store import JsonFileWarmRuntimeStore
 
 router = APIRouter(prefix="/warm-runtimes", tags=["Warm Runtimes"])
+
+
+def _lease_payload(lease: ClaimLease) -> dict[str, object]:
+    return {
+        "leaseId": lease.lease_id,
+        "runtimeId": lease.runtime_id,
+        "generation": lease.generation,
+        "fencingToken": lease.fencing_token,
+        "expiresAt": lease.expires_at,
+    }
 
 # 默认在内存里跑 PoC；生产由环境变量选择持久化后端，避免默认写磁盘。
 #   WARM_RUNTIME_STORE=sqlite + WARM_RUNTIME_DB_PATH   -> 行级更新，推荐
@@ -97,16 +108,7 @@ def claim_warm_runtime(request: ClaimWarmRuntimeRequest) -> dict[str, object]:
     lease = _pool.claim(request.profile.to_domain(), request.binding.to_domain())
     if lease is None:
         return {"lease": None, "poolHit": False}
-    return {
-        "poolHit": True,
-        "lease": {
-            "leaseId": lease.lease_id,
-            "runtimeId": lease.runtime_id,
-            "generation": lease.generation,
-            "fencingToken": lease.fencing_token,
-            "expiresAt": lease.expires_at,
-        },
-    }
+    return {"poolHit": True, "lease": _lease_payload(lease)}
 
 
 @router.post("/leases/{lease_id}/release", status_code=status.HTTP_204_NO_CONTENT)
@@ -119,6 +121,48 @@ def release_warm_runtime(
         _pool.release(lease_id, fencing_token, cleanup_ok=cleanup_ok)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="lease_conflict") from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/begin-claim")
+def begin_warm_runtime_claim(request: ClaimWarmRuntimeRequest) -> dict[str, object]:
+    """两阶段领取第一步：READY -> CLAIMING，返回待确认 lease。"""
+    lease = _pool.begin_claim(
+        request.profile.to_domain(), request.binding.to_domain()
+    )
+    if lease is None:
+        return {"poolHit": False, "lease": None}
+    return {"poolHit": True, "lease": _lease_payload(lease)}
+
+
+@router.post("/leases/{lease_id}/confirm")
+def confirm_warm_runtime_claim(
+    lease_id: str,
+    fencing_token: Annotated[str, Query(min_length=1)],
+) -> dict[str, object]:
+    """两阶段领取第二步：CLAIMING -> LEASED。"""
+    try:
+        lease = _pool.confirm_claim(lease_id, fencing_token)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="lease_not_confirmable"
+        ) from exc
+    return {"lease": _lease_payload(lease)}
+
+
+@router.post("/leases/{lease_id}/abort", status_code=status.HTTP_204_NO_CONTENT)
+def abort_warm_runtime_claim(
+    lease_id: str,
+    fencing_token: Annotated[str, Query(min_length=1)],
+    cleanup_ok: Annotated[bool, Query(alias="cleanupOk")] = True,
+) -> Response:
+    """放弃待确认 lease：cleanup 成功回 READY，否则进 QUARANTINE。"""
+    try:
+        _pool.abort_claim(lease_id, fencing_token, cleanup_ok=cleanup_ok)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="lease_not_confirmable"
+        ) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
