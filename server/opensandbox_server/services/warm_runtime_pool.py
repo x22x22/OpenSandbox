@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from opensandbox_server.services.warm_runtime_store import WarmRuntimeStore
@@ -96,21 +97,47 @@ class WarmRuntimePool:
             self.cleanup_failures = metrics.get("cleanup_failures", 0)
             self.reconcile_conflicts = metrics.get("reconcile_conflicts", 0)
 
+    def _metrics(self) -> dict[str, int]:
+        return {
+            "pool_hits": self.pool_hits,
+            "pool_misses": self.pool_misses,
+            "cleanup_failures": self.cleanup_failures,
+            "reconcile_conflicts": self.reconcile_conflicts,
+        }
+
     def _persist(self) -> None:
         if self._store is None:
             return
-        self._store.save(
-            self._runtimes,
-            {
-                "pool_hits": self.pool_hits,
-                "pool_misses": self.pool_misses,
-                "cleanup_failures": self.cleanup_failures,
-                "reconcile_conflicts": self.reconcile_conflicts,
-            },
-        )
+        self._store.save(self._runtimes, self._metrics())
+
+    def _reload(self) -> None:
+        if self._store is None:
+            return
+        runtimes, metrics = self._store.load()
+        self._runtimes = runtimes
+        self.pool_hits = metrics.get("pool_hits", 0)
+        self.pool_misses = metrics.get("pool_misses", 0)
+        self.cleanup_failures = metrics.get("cleanup_failures", 0)
+        self.reconcile_conflicts = metrics.get("reconcile_conflicts", 0)
+
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        """带跨进程锁的读-改-写事务。
+
+        有 store 时先取排他锁并重新加载最新状态，退出时落盘；没有 store 时
+        退化为原有的进程内 ``RLock`` 语义。
+        """
+        with self._lock:
+            if self._store is None:
+                yield
+                return
+            with self._store.exclusive():
+                self._reload()
+                yield
+                self._persist()
 
     def register_ready(self, runtime_id: str, profile: RuntimeProfile) -> None:
-        with self._lock:
+        with self._transaction():
             current = self._runtimes.get(runtime_id)
             if current and current.state is WarmRuntimeState.LEASED:
                 raise ValueError("cannot replace a leased runtime")
@@ -121,7 +148,6 @@ class WarmRuntimePool:
                 generation=generation,
                 updated_at=time.time(),
             )
-            self._persist()
 
     def claim(
         self,
@@ -130,7 +156,7 @@ class WarmRuntimePool:
         *,
         now: float | None = None,
     ) -> ClaimLease | None:
-        with self._lock:
+        with self._transaction():
             current = next(
                 (
                     runtime
@@ -142,7 +168,6 @@ class WarmRuntimePool:
             )
             if current is None:
                 self.pool_misses += 1
-                self._persist()
                 return None
             self.pool_hits += 1
             current.state = WarmRuntimeState.CLAIMING
@@ -160,11 +185,10 @@ class WarmRuntimePool:
             current.lease = lease
             current.state = WarmRuntimeState.LEASED
             current.updated_at = issued_at
-            self._persist()
             return lease
 
     def release(self, lease_id: str, fencing_token: str, *, cleanup_ok: bool) -> None:
-        with self._lock:
+        with self._transaction():
             runtime = self._find_lease(lease_id)
             if runtime.lease is None or runtime.lease.fencing_token != fencing_token:
                 raise ValueError("fencing token mismatch")
@@ -177,12 +201,11 @@ class WarmRuntimePool:
                 self.cleanup_failures += 1
                 runtime.state = WarmRuntimeState.QUARANTINE
             runtime.updated_at = time.time()
-            self._persist()
 
     def expire_leases(self, *, now: float | None = None) -> int:
         current_time = time.time() if now is None else now
         expired = 0
-        with self._lock:
+        with self._transaction():
             for runtime in self._runtimes.values():
                 if (
                     runtime.state is WarmRuntimeState.LEASED
@@ -191,13 +214,11 @@ class WarmRuntimePool:
                 ):
                     runtime.state = WarmRuntimeState.QUARANTINE
                     expired += 1
-            if expired:
-                self._persist()
         return expired
 
     def reconcile(self, actual_runtime_ids: set[str]) -> int:
         conflicts = 0
-        with self._lock:
+        with self._transaction():
             for runtime in self._runtimes.values():
                 if runtime.runtime_id not in actual_runtime_ids and runtime.state not in {
                     WarmRuntimeState.QUARANTINE,
@@ -206,13 +227,11 @@ class WarmRuntimePool:
                     runtime.state = WarmRuntimeState.QUARANTINE
                     conflicts += 1
             self.reconcile_conflicts += conflicts
-            if conflicts:
-                self._persist()
         return conflicts
 
     def refill(self, profile: RuntimeProfile, target: int, factory: Callable[[], str]) -> int:
         created = 0
-        with self._lock:
+        with self._transaction():
             ready = sum(
                 runtime.state is WarmRuntimeState.READY and runtime.profile == profile
                 for runtime in self._runtimes.values()
@@ -221,16 +240,16 @@ class WarmRuntimePool:
                 self.register_ready(factory(), profile)
                 ready += 1
                 created += 1
-            if created:
-                self._persist()
         return created
 
     def get(self, runtime_id: str) -> WarmRuntime:
         with self._lock:
+            self._reload()
             return self._runtimes[runtime_id]
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
+            self._reload()
             states = {state.value: 0 for state in WarmRuntimeState}
             for runtime in self._runtimes.values():
                 states[runtime.state.value] += 1

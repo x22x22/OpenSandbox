@@ -134,3 +134,123 @@ def test_store_file_contains_no_secret_material(tmp_path) -> None:
     assert "password" not in text.lower()
     assert "token" not in text.lower() or "fencing_token" in text
     assert "runtime-1" in text
+
+
+def _claim_worker(args: tuple[str, str, str, bool]) -> str:
+    """跨进程 worker：两个控制面进程竞争同一个 READY runtime。
+
+    ``slow`` 会先 load 再等待，用来制造「两个进程都读到 READY」的确定性竞争窗口；
+    若没有跨进程锁，两个进程都会发放同一个 runtime。
+    """
+    store_path, session_id, gate_path, slow = args
+    import os
+    import time
+
+    from opensandbox_server.services.warm_runtime_pool import (
+        RuntimeProfile,
+        WarmRuntimePool,
+        WorkspaceBinding,
+    )
+    from opensandbox_server.services.warm_runtime_store import (
+        JsonFileWarmRuntimeStore,
+    )
+
+    class _SlowStore(JsonFileWarmRuntimeStore):
+        def load(self):
+            result = super().load()
+            if slow:
+                time.sleep(0.25)
+            return result
+
+    prof = RuntimeProfile(
+        node_id="node-a",
+        profile_id="medium",
+        image_digest="sha256:image-v1",
+        runtime_version="opencode-1.14.41",
+        cpu=4,
+        memory_mb=4096,
+        policy_version="policy-v1",
+        mount_policy="create-time-volume-attach",
+    )
+    bind = WorkspaceBinding(
+        tenant_id="tenant-a",
+        project_id="project-a",
+        session_id=session_id,
+        workspace_volume_id=f"ws-{session_id}",
+        runtime_data_volume_id=f"rt-{session_id}",
+        artifacts_volume_id=f"art-{session_id}",
+        mount_signature=f"m-{session_id}",
+    )
+    pool = WarmRuntimePool(store=_SlowStore(store_path))
+    deadline = time.time() + 10
+    while not os.path.exists(gate_path) and time.time() < deadline:
+        time.sleep(0.01)
+    lease = pool.claim(prof, bind)
+    return "" if lease is None else lease.runtime_id
+
+
+def test_two_processes_cannot_claim_the_same_runtime(tmp_path) -> None:
+    import multiprocessing
+
+    store_path = tmp_path / "pool.json"
+    gate = tmp_path / "gate"
+    pool(store_path).register_ready("runtime-1", profile())
+
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(processes=2) as workers:
+        async_result = workers.map_async(
+            _claim_worker,
+            [
+                (str(store_path), "session-1", str(gate), True),
+                (str(store_path), "session-2", str(gate), True),
+            ],
+        )
+        gate.write_text("go", encoding="utf-8")
+        results = async_result.get(timeout=90)
+
+    winners = [runtime_id for runtime_id in results if runtime_id]
+    assert winners == ["runtime-1"], f"expected exactly one winner, got {results}"
+
+    final = pool(store_path)
+    assert final.snapshot()["states"]["LEASED"] == 1
+
+
+def test_exclusive_lock_is_mutually_exclusive_across_processes(tmp_path) -> None:
+    """确定性验证 flock 互斥：B 的临界区必须晚于 A 的临界区结束。"""
+    import multiprocessing
+
+    store_path = tmp_path / "pool.json"
+    log_path = tmp_path / "log.txt"
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(processes=2) as workers:
+        workers.map(
+            _lock_probe,
+            [
+                (str(store_path), str(log_path), "A", 0.0),
+                (str(store_path), str(log_path), "B", 0.05),
+            ],
+        )
+
+    lines = [line for line in log_path.read_text().splitlines() if line]
+    assert len(lines) == 4, lines
+    order = [line.split(":")[1] for line in lines]
+    # A 先进入；B 只能等 A 退出后才进入
+    assert order == ["A", "A", "B", "B"], lines
+
+
+def _lock_probe(args: tuple[str, str, str, float]) -> None:
+    import time
+
+    from opensandbox_server.services.warm_runtime_store import (
+        JsonFileWarmRuntimeStore,
+    )
+
+    store_path, log_path, label, delay = args
+    store = JsonFileWarmRuntimeStore(store_path)
+    time.sleep(delay)
+    with store.exclusive():
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"in:{label}\n")
+        time.sleep(0.2)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"out:{label}\n")
