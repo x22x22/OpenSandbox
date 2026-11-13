@@ -344,6 +344,7 @@ class WarmRuntimePool:
         self,
         actual_runtime_ids: set[str],
         *,
+        actual_bound_runtime_ids: set[str] | None = None,
         force: bool = False,
         max_quarantine: int = 50,
     ) -> int:
@@ -368,6 +369,20 @@ class WarmRuntimePool:
                 }:
                     runtime.state = WarmRuntimeState.QUARANTINE
                     conflicts += 1
+            if actual_bound_runtime_ids is not None:
+                for runtime in self._runtimes.values():
+                    if runtime.bound_runtime_id is None:
+                        continue
+                    if runtime.state in {
+                        WarmRuntimeState.QUARANTINE,
+                        WarmRuntimeState.DRAINING,
+                    }:
+                        continue
+                    if runtime.bound_runtime_id not in actual_bound_runtime_ids:
+                        runtime.state = WarmRuntimeState.QUARANTINE
+                        runtime.updated_at = time.time()
+                        conflicts += 1
+
             self.reconcile_conflicts += conflicts
         return conflicts
 

@@ -449,6 +449,7 @@ class SqliteWarmRuntimePool:
         self,
         actual_runtime_ids: set[str],
         *,
+        actual_bound_runtime_ids: set[str] | None = None,
         force: bool = False,
         max_quarantine: int = DEFAULT_MAX_RECONCILE_QUARANTINE,
     ) -> int:
@@ -493,6 +494,32 @@ class SqliteWarmRuntimePool:
                     ),
                 )
             conflicts = cursor.rowcount or 0
+
+            # 槽位还在但绑定的容器已被外部删除：cleanup 目标消失，必须隔离。
+            if actual_bound_runtime_ids is not None:
+                rows = self._conn.execute(
+                    """
+                    SELECT runtime_id, bound_runtime_id FROM warm_runtimes
+                    WHERE bound_runtime_id IS NOT NULL
+                      AND state NOT IN (?, ?)
+                    """,
+                    (
+                        WarmRuntimeState.QUARANTINE.value,
+                        WarmRuntimeState.DRAINING.value,
+                    ),
+                ).fetchall()
+                missing = [
+                    row["runtime_id"]
+                    for row in rows
+                    if row["bound_runtime_id"] not in actual_bound_runtime_ids
+                ]
+                for runtime_id in missing:
+                    self._conn.execute(
+                        "UPDATE warm_runtimes SET state = ?, updated_at = ? WHERE runtime_id = ?",
+                        (WarmRuntimeState.QUARANTINE.value, time.time(), runtime_id),
+                    )
+                conflicts += len(missing)
+
             if conflicts:
                 self._add("reconcile_conflicts", conflicts)
         return conflicts

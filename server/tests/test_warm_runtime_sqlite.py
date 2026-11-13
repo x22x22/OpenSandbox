@@ -382,3 +382,36 @@ def test_bound_runtime_id_survives_restart(tmp_path) -> None:
 
     restarted = SqliteWarmRuntimePool(path, lease_ttl_seconds=300)
     assert restarted.get("slot-1").bound_runtime_id == "container-abc"
+
+
+def test_reconcile_quarantines_slot_whose_bound_runtime_disappeared(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("slot-keep", profile())
+    ledger.register_ready("slot-gone", profile())
+    for slot in ("slot-keep", "slot-gone"):
+        lease = ledger.claim(profile(), binding(slot))
+        assert lease is not None
+        ledger.bind_runtime(lease.lease_id, lease.fencing_token, f"container-{slot}")
+
+    # 槽位都还在，但 slot-gone 绑定的容器已被外部删除
+    quarantined = ledger.reconcile(
+        {"slot-keep", "slot-gone"},
+        actual_bound_runtime_ids={"container-slot-keep"},
+    )
+
+    assert quarantined == 1
+    assert ledger.get("slot-keep").state is WarmRuntimeState.LEASED
+    assert ledger.get("slot-gone").state is WarmRuntimeState.QUARANTINE
+    # 保留绑定值供审计
+    assert ledger.get("slot-gone").bound_runtime_id == "container-slot-gone"
+
+
+def test_reconcile_without_bound_ids_keeps_backward_behaviour(tmp_path) -> None:
+    ledger = pool(tmp_path)
+    ledger.register_ready("slot-1", profile())
+    lease = ledger.claim(profile(), binding())
+    assert lease is not None
+    ledger.bind_runtime(lease.lease_id, lease.fencing_token, "container-1")
+
+    assert ledger.reconcile({"slot-1"}) == 0
+    assert ledger.get("slot-1").state is WarmRuntimeState.LEASED

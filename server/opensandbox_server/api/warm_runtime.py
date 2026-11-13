@@ -95,6 +95,8 @@ class ClaimWarmRuntimeRequest(BaseModel):
 
 class ReconcileWarmRuntimeRequest(BaseModel):
     runtime_ids: set[str] = Field(default_factory=set)
+    #: 实际存在的「已绑定容器 id」；提供后，绑定容器已消失的槽位会被隔离。
+    bound_runtime_ids: set[str] | None = None
 
 
 @router.post("/register", status_code=status.HTTP_204_NO_CONTENT)
@@ -209,7 +211,11 @@ def reconcile_warm_runtimes(
     force: Annotated[bool, Query()] = False,
 ) -> dict[str, int]:
     try:
-        quarantined = _pool.reconcile(request.runtime_ids, force=force)
+        quarantined = _pool.reconcile(
+            request.runtime_ids,
+            actual_bound_runtime_ids=request.bound_runtime_ids,
+            force=force,
+        )
     except ValueError as exc:
         # 保护触发：调用方只给了部分视图，拒绝大批量隔离健康 runtime。
         raise HTTPException(
