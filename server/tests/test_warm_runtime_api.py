@@ -106,3 +106,76 @@ def test_warm_runtime_routes_register_through_fastapi(monkeypatch):
     assert released.status_code == 204
     assert released.content == b""
     assert client.get("/warm-runtimes/status").json()["states"]["READY"] == 1
+
+
+def test_route_can_run_on_sqlite_backend(tmp_path, monkeypatch):
+    """真实路由 + SQLite 行级 ledger：状态语义必须与内存实现一致。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from opensandbox_server.services.warm_runtime_sqlite import SqliteWarmRuntimePool
+
+    monkeypatch.setattr(
+        warm_runtime,
+        "_pool",
+        SqliteWarmRuntimePool(tmp_path / "route.db", lease_ttl_seconds=300),
+    )
+    app = FastAPI()
+    app.include_router(warm_runtime.router)
+    client = TestClient(app)
+
+    assert (
+        client.post(
+            "/warm-runtimes/register",
+            json={"runtime_id": "runtime-1", "profile": _profile().model_dump()},
+        ).status_code
+        == 204
+    )
+
+    claimed = client.post(
+        "/warm-runtimes/claim",
+        json={"profile": _profile().model_dump(), "binding": _binding().model_dump()},
+    )
+    assert claimed.status_code == 200
+    assert claimed.json()["poolHit"] is True
+    lease = claimed.json()["lease"]
+
+    # 同一 profile 再领取必须 miss
+    again = client.post(
+        "/warm-runtimes/claim",
+        json={"profile": _profile().model_dump(), "binding": _binding().model_dump()},
+    )
+    assert again.json()["poolHit"] is False
+
+    assert (
+        client.post(
+            f"/warm-runtimes/leases/{lease['leaseId']}/release",
+            params={"fencing_token": lease["fencingToken"], "cleanupOk": "false"},
+        ).status_code
+        == 204
+    )
+    status = client.get("/warm-runtimes/status").json()
+    assert status["states"]["QUARANTINE"] == 1
+    assert status["cleanupFailures"] == 1
+
+
+def test_build_pool_selects_backend_from_env(tmp_path, monkeypatch):
+    from opensandbox_server.services.warm_runtime_sqlite import SqliteWarmRuntimePool
+
+    monkeypatch.setenv("WARM_RUNTIME_STORE", "sqlite")
+    monkeypatch.setenv("WARM_RUNTIME_DB_PATH", str(tmp_path / "picked.db"))
+    assert isinstance(warm_runtime._build_pool(), SqliteWarmRuntimePool)
+
+    monkeypatch.setenv("WARM_RUNTIME_STORE", "json")
+    monkeypatch.setenv("WARM_RUNTIME_STORE_PATH", str(tmp_path / "picked.json"))
+    assert not isinstance(warm_runtime._build_pool(), SqliteWarmRuntimePool)
+
+    monkeypatch.setenv("WARM_RUNTIME_STORE", "json")
+    monkeypatch.delenv("WARM_RUNTIME_STORE_PATH")
+    import pytest
+
+    with pytest.raises(RuntimeError, match="requires WARM_RUNTIME_STORE_PATH"):
+        warm_runtime._build_pool()
+
+    monkeypatch.delenv("WARM_RUNTIME_STORE")
+    assert not isinstance(warm_runtime._build_pool(), SqliteWarmRuntimePool)

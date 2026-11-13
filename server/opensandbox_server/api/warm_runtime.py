@@ -17,17 +17,28 @@ from opensandbox_server.services.warm_runtime_pool import (
     WarmRuntimePool,
     WorkspaceBinding,
 )
+from opensandbox_server.services.warm_runtime_sqlite import SqliteWarmRuntimePool
 from opensandbox_server.services.warm_runtime_store import JsonFileWarmRuntimeStore
 
 router = APIRouter(prefix="/warm-runtimes", tags=["Warm Runtimes"])
 
+# 默认在内存里跑 PoC；生产由环境变量选择持久化后端，避免默认写磁盘。
+#   WARM_RUNTIME_STORE=sqlite + WARM_RUNTIME_DB_PATH   -> 行级更新，推荐
+#   WARM_RUNTIME_STORE=json   + WARM_RUNTIME_STORE_PATH -> 全量重写，仅小规模
+_DEFAULT_SQLITE_PATH = "warm-runtimes.sqlite3"
 
-def _build_pool() -> WarmRuntimePool:
-    """Use a durable ledger when a store path is configured, else in-memory."""
-    store_path = (os.getenv("WARM_RUNTIME_STORE_PATH") or "").strip()
-    if not store_path:
-        return WarmRuntimePool()
-    return WarmRuntimePool(store=JsonFileWarmRuntimeStore(store_path))
+
+def _build_pool() -> "WarmRuntimePool | SqliteWarmRuntimePool":
+    backend = (os.getenv("WARM_RUNTIME_STORE") or "").strip().lower()
+    if backend == "sqlite":
+        db_path = (os.getenv("WARM_RUNTIME_DB_PATH") or "").strip() or _DEFAULT_SQLITE_PATH
+        return SqliteWarmRuntimePool(db_path)
+    if backend == "json":
+        store_path = (os.getenv("WARM_RUNTIME_STORE_PATH") or "").strip()
+        if not store_path:
+            raise RuntimeError("WARM_RUNTIME_STORE=json requires WARM_RUNTIME_STORE_PATH")
+        return WarmRuntimePool(store=JsonFileWarmRuntimeStore(store_path))
+    return WarmRuntimePool()
 
 
 _pool = _build_pool()
