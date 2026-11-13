@@ -189,6 +189,19 @@ class WarmRuntimePool:
         with self._lock:
             return self._runtimes[runtime_id]
 
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            states = {state.value: 0 for state in WarmRuntimeState}
+            for runtime in self._runtimes.values():
+                states[runtime.state.value] += 1
+            return {
+                "states": states,
+                "poolHits": self.pool_hits,
+                "poolMisses": self.pool_misses,
+                "cleanupFailures": self.cleanup_failures,
+                "reconcileConflicts": self.reconcile_conflicts,
+            }
+
     def _find_lease(self, lease_id: str) -> WarmRuntime:
         for runtime in self._runtimes.values():
             if runtime.lease and runtime.lease.lease_id == lease_id:

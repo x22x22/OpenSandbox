@@ -41,6 +41,7 @@ _log_config = configure_logging(app_config.log)
 
 from opensandbox_server.api.devops import router as devops_router  # noqa: E402
 from opensandbox_server.api.pool import router as pool_router  # noqa: E402
+from opensandbox_server.api.warm_runtime import router as warm_runtime_router  # noqa: E402
 from opensandbox_server.api.lifecycle import router, sandbox_service, snapshot_service  # noqa: E402
 from opensandbox_server.api.proxy import router as proxy_router  # noqa: E402
 from opensandbox_server.integrations.renew_intent.proxy_renew import ProxyRenewCoordinator  # noqa: E402
@@ -151,10 +152,12 @@ app.add_middleware(RequestIdMiddleware)
 app.include_router(router)
 app.include_router(devops_router)
 app.include_router(pool_router)
+app.include_router(warm_runtime_router)
 app.include_router(proxy_router)
 app.include_router(router, prefix="/v1")
 app.include_router(devops_router, prefix="/v1")
 app.include_router(pool_router, prefix="/v1")
+app.include_router(warm_runtime_router, prefix="/v1")
 app.include_router(proxy_router, prefix="/v1")
 
 DEFAULT_ERROR_CODE = "GENERAL::UNKNOWN_ERROR"
